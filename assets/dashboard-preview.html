@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MiniOS Dashboard Preview</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; }
+    body {
+      font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+      background: #010409;
+      color: #f0f6fc;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    .phone {
+      width: 390px;
+      max-width: 100%;
+      border-radius: 28px;
+      overflow: hidden;
+      border: 1px solid #30363d;
+      background: #0d1117;
+      box-shadow: 0 24px 80px rgba(0,0,0,.55);
+    }
+    header {
+      padding: 20px 24px 12px;
+      background: linear-gradient(180deg, #0b1929, #0d1117);
+    }
+    header h1 { font-size: 1.5rem; font-weight: 700; }
+    header p { color: #8b949e; margin-top: 4px; font-size: .85rem; }
+    .status { color: #58a6ff; font-size: .8rem; margin-top: 10px; }
+    nav {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+      padding: 0 12px 12px;
+    }
+    nav button {
+      border: 1px solid #30363d;
+      background: #21262d;
+      color: #f0f6fc;
+      border-radius: 10px;
+      padding: 10px 4px;
+      font-size: .72rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    nav button.active { background: #1f6feb; border-color: #388bfd; }
+    main { padding: 0 16px 24px; }
+    .card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 14px;
+      padding: 16px;
+      margin-bottom: 12px;
+    }
+    .card label { color: #8b949e; font-size: .75rem; text-transform: uppercase; letter-spacing: .06em; }
+    .row { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; }
+    .bar { height: 10px; background: #21262d; border-radius: 999px; overflow: hidden; margin-top: 12px; }
+    .bar > span { display: block; height: 100%; border-radius: 999px; }
+    .cpu { background: #58a6ff; width: 42%; }
+    .ram { background: #3fb950; width: 68%; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .grid button {
+      border: 1px solid #30363d;
+      border-radius: 12px;
+      padding: 18px 8px;
+      font-weight: 700;
+      color: #fff;
+      cursor: pointer;
+    }
+    .off { background: #f85149; }
+    .reb { background: #d29922; }
+    .fb { background: #58a6ff; }
+    .rec { background: #bc8cff; }
+    .note { color: #8b949e; font-size: .75rem; margin-top: 16px; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <div class="phone" id="root"></div>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script type="text/babel">
+    const { useState, useEffect } = React;
+
+    function App() {
+      const [tab, setTab] = useState('dash');
+      const [cpu, setCpu] = useState(18);
+      const [ram, setRam] = useState({ used: 712, total: 3640 });
+
+      useEffect(() => {
+        const t = setInterval(() => {
+          setCpu(c => Math.min(95, Math.max(5, c + (Math.random() * 20 - 10))));
+        }, 1200);
+        return () => clearInterval(t);
+      }, []);
+
+      const pct = Math.round((ram.used / ram.total) * 100);
+
+      return (
+        <>
+          <header>
+            <h1>MiniOS</h1>
+            <p>Dashboard preview — on-device UI is native C (fast)</p>
+            <div className="status">USB ADB 18d1:4ee7 active</div>
+          </header>
+          <nav>
+            {['dash','power','sys','radio'].map(id => (
+              <button key={id} className={tab === id ? 'active' : ''} onClick={() => setTab(id)}>
+                {id.toUpperCase()}
+              </button>
+            ))}
+          </nav>
+          <main>
+            {tab === 'dash' && (
+              <>
+                <div className="card">
+                  <label>CPU load</label>
+                  <div className="row"><strong>{cpu.toFixed(0)}%</strong></div>
+                  <div className="bar"><span className="cpu" style={{width: cpu + '%'}} /></div>
+                </div>
+                <div className="card">
+                  <label>Memory</label>
+                  <div className="row"><strong>{ram.used} / {ram.total} MB</strong></div>
+                  <div className="bar"><span className="ram" style={{width: pct + '%'}} /></div>
+                </div>
+                <div className="card"><label>Uptime</label><div className="row"><strong>0:05:23</strong></div></div>
+              </>
+            )}
+            {tab === 'power' && (
+              <div className="grid">
+                <button className="off">POWER OFF</button>
+                <button className="reb">REBOOT</button>
+                <button className="fb">FASTBOOT</button>
+                <button className="rec">RECOVERY</button>
+              </div>
+            )}
+            {tab === 'sys' && (
+              <div className="card">
+                <label>System</label>
+                <p style={{marginTop:12}}>Touch OK · USB ADB · COM via button</p>
+              </div>
+            )}
+            {tab === 'radio' && (
+              <div className="card">
+                <label>Wireless</label>
+                <p style={{marginTop:12}}>WiFi / BT — driver bring-up planned</p>
+              </div>
+            )}
+            <p className="note">Open this file in a browser for design reference. Phone runs minui framebuffer UI with the same layout.</p>
+          </main>
+        </>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
