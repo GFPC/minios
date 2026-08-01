@@ -12,6 +12,7 @@
 #include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -113,20 +114,43 @@ pid_t start_ffs_adb(void)
 void write_adb_keys(void)
 {
     const char key[] =
-        "QAAAAG0WHAibnCTan58gT/CZVzsdkb3RuJNrgjorNlD2OVfRDnh6v24lBgp9ZHIfTawwrnYFXNLzHDS2rlvPw7Zl/mvFbti80+vnMH1aYji3yzQ8WsvqpvIQHlxi4RsODdS2nmnWr1IUBcGktUuxuHajmU2geaeKctU3ZLM/Vn4r5qMJKjjFKrVamU4w8XBjKexpxMnTA7R52J8Ey1mEEKwFXyMktgwwtwMWXOQOB/eYwHOsOzPJmDzosYuZ+atry32EoXlwrmGW4sAmrW3t7rwcy7tDYz6sJdBjrNI3jKHVjcTLriHgki7Rdz80POe1m9Zf4T0/fNRoAHnSmYdZN6StiY9p1ImDc40LnuDfvH2/jrFNOWlMFbQixJQoh5IMGD2q2FYt6wZngEcP7Of8qvc0al6FdK8unXDBvqyUNik0YuFV15XV2ZnP5LE6b8vi7cF2RGC5XaR5Ixza7Ax3rXC+ITeZ40WP5iiQui/D++r0xfR9p3vo/BQlrdUo8Rq5quJ6GfjxsQDsQUHAwXVe89F1wOaIkxIWYeTzwlny3w5l0706DqOzlLorQ+wJchQOWfNmu743DmEJpdX9gOqxc0oobzcA7I6mBmo+JbwaLD4MTwCcU5Xfci1sxKHVBZyDJWjEomBn0YBNFV/9QhTiB40Nq71Kl6iuMcGSCk+0aX68a1Cx7nO1WQEAAQA= greg@DESKTOP-TNSQ33O\n";
+        "QAAAAKfEjNPpXMO1XPxILUnUZnb0eE1oypAXchhM6bHFKwGrDuI6h5pB89H6sBb5ZM1wL6TRuAD0DDTjNy6bmfQMw3okiyeNdpOdic33SiAJflxR8dUmztmgQQFUBXd5RuQ3/pHLNXdZ6k9bT1KevMcwTNXH+SffdAeAKe9EgkZN5EL8ZO72mSZnfdgYroudNwZwEYmpSO41juwpKxgUwdDVjSrYNrwc95tZrK+7G1vn+aq9gY7npdGfMzbz53+TkFN9j2aW+eCdD+K9Q0F7Ph6Aj32V1vzScDy9F8GTC+NPhmRYETDI9j5dsEzEOXg0OGr2E1eg+VqvCYJN+BtMviNZVdwq6wCsPvmZO53KJp6OxhSbi4KmXzpGR9f45MwLOq7dEV9h1vnTkLYODiyNu9LSmKsn/KvfQ1unsCe4uyOHLdB+jsYaHy6Lv885R1UKczv2VIB8hc5lx7QJTUzgnaPo6LzhRvgQPZ6AoqK3nU1jUS1TpjqjUPEvEirTROghojFFru6q4GHoz9LZgNQR2+sszDbnQ0Ue4mVI4VH+C5tM+ysQaPAwyXVDv2BCdv6vgudT6Pmnw7LQG28WFAMNK34RLgAwOj8OW4dcup3pqoz3Ivm2Ln9bFRvp4dnHTKTQQNRk+7deCFybIrvLyHjhs8MrsdsuHoMq0yR7bx4Uda/jX1TNxgClDQEAAQA= greg@DESKTOP-TNSQ33O\n";
     const char *paths[] = { "/data/misc/adb/adb_keys", "/adb_keys", NULL };
     size_t len = strlen(key);
 
     sysfs_mkdir("/data/misc/adb");
-    chmod("/data/misc/adb", 0700);
+    chmod("/data/misc/adb", 0755);
     for (int i = 0; paths[i]; i++) {
-        int fd = open(paths[i], O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        int fd = open(paths[i], O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd >= 0) {
             write(fd, key, len);
             close(fd);
         }
     }
     klog("adb: keys written");
+}
+
+static int adb_setup_control_socket(void)
+{
+    const char *path = "/dev/socket/adbd";
+    struct sockaddr_un addr;
+    int fd;
+
+    mkdir("/dev/socket", 0777);
+    unlink(path);
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0)
+        return -1;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        return -1;
+    }
+    chmod(path, 0666);
+    listen(fd, 4);
+    return fd;
 }
 
 void adb_tcp_selftest(void)
@@ -170,6 +194,48 @@ void adb_tcp_selftest(void)
     close(s);
 }
 
+static void copy_linker64(void)
+{
+    struct stat st;
+    const char *src = NULL;
+    const char *candidates[] = {
+        "/lib64/linker64",
+        "/vendor/bin/linker64",
+        "/system/bin/linker64",
+        NULL
+    };
+
+    for (int i = 0; candidates[i]; i++) {
+        if (lstat(candidates[i], &st) == 0 && S_ISREG(st.st_mode)) {
+            src = candidates[i];
+            break;
+        }
+    }
+    if (!src)
+        return;
+
+    if (lstat("/lib64/linker64", &st) != 0 || !S_ISREG(st.st_mode)) {
+        if (lstat("/lib64/linker64", &st) == 0)
+            unlink("/lib64/linker64");
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd), "cp -f '%s' /lib64/linker64 && chmod 755 /lib64/linker64", src);
+        system(cmd);
+    }
+
+    // Ensure /apex/com.android.runtime/bin/linker64 exists
+    sysfs_mkdir("/apex");
+    sysfs_mkdir("/apex/com.android.runtime");
+    sysfs_mkdir("/apex/com.android.runtime/bin");
+    system("cp -f /lib64/linker64 /apex/com.android.runtime/bin/linker64 && chmod 755 /apex/com.android.runtime/bin/linker64");
+
+    if (lstat("/system/bin/linker64", &st) != 0 || !S_ISREG(st.st_mode)) {
+        if (lstat("/system/bin/linker64", &st) == 0)
+            unlink("/system/bin/linker64");
+        system("cp -f /lib64/linker64 /system/bin/linker64 && chmod 755 /system/bin/linker64");
+    }
+}
+
+
 void adb_env_prepare(void)
 {
     const char *ldtxt =
@@ -193,9 +259,7 @@ void adb_env_prepare(void)
 
     if (access("/system/lib64", F_OK) != 0)
         symlink("/lib64", "/system/lib64");
-    if (access("/system/bin/linker64", F_OK) != 0 &&
-        access("/lib64/linker64", F_OK) == 0)
-        symlink("/lib64/linker64", "/system/bin/linker64");
+    copy_linker64();
     if (access("/system/bin/adbd", F_OK) != 0 &&
         access("/sbin/adbd", X_OK) == 0)
         symlink("/sbin/adbd", "/system/bin/adbd");
@@ -244,16 +308,22 @@ pid_t adb_start_daemon(void)
     }
 
     sysfs_mkdir("/system/bin");
-    if (access("/system/bin/linker64", F_OK) != 0 &&
-        access("/lib64/linker64", F_OK) == 0)
-        symlink("/lib64/linker64", "/system/bin/linker64");
+    copy_linker64();
 
     adb_env_prepare();
 
     pid_t p = fork();
     if (p == 0) {
+        int sock = adb_setup_control_socket();
         int lfd = open("/tmp/adbd.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
 
+        if (sock >= 0) {
+            if (sock != 3) {
+                dup2(sock, 3);
+                close(sock);
+            }
+            setenv("ANDROID_SOCKET_adbd", "3", 1);
+        }
         if (lfd >= 0) {
             dup2(lfd, 1);
             dup2(lfd, 2);
@@ -263,12 +333,14 @@ pid_t adb_start_daemon(void)
         setenv("ANDROID_DATA", "/data", 1);
         setenv("ANDROID_RUNTIME_ROOT", "/system", 1);
         setenv("TMPDIR", "/tmp", 1);
+        setenv("ANDROID_ADB_SERVER_PORT", "5555", 1);
+        setenv("ADB_TRACE", "all", 1);
         setenv("LD_LIBRARY_PATH", "/system/lib64:/lib64", 1);
         if (access("/lib64/propstub.so", F_OK) == 0)
             setenv("LD_PRELOAD", "/lib64/propstub.so", 1);
-        execl("/system/bin/adbd", "adbd", "--root_seclabel=u:r:su:s0",
-              "--device_banner=recovery", NULL);
         execl("/sbin/adbd", "adbd", "--root_seclabel=u:r:su:s0",
+              "--device_banner=recovery", NULL);
+        execl("/system/bin/adbd", "adbd", "--root_seclabel=u:r:su:s0",
               "--device_banner=recovery", NULL);
         klogf("adb: execl errno=%d", errno);
         _exit(127);

@@ -1,0 +1,1 @@
+obj-m := minios_modem_boot.o qrtr_snoop.o

@@ -19,5 +19,9 @@ void usb_tcp_adb_async(void);
 void usb_net_setup(void);
 int usb_open_com_tty(void);
 void usb_udc_load(void);
+void usb_com_maintain(void);
+void usb_rebind_request(void);
+int usb_enable_ncm(void);
+int usb_add_diag(void);
 
 #endif

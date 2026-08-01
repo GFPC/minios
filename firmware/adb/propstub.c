@@ -107,11 +107,43 @@ static const struct {
 	{ "persist.adb.watchdog.disable", "1" },
 	{ "persist.adb.watchdog", "0" },
 	{ "persist.adb.tls_server.enable", "0" },
+	{ "service.adb.tls.port", "0" },
+	{ "ro.build.tags", "test-keys" },
+	{ "ro.build.fingerprint", "Xiaomi/willow/willow:14/UP1A.231005.007/V12.5.3.0.RCWMIXM:user/release-keys" },
 	{ "init.svc.adbd", "running" },
 	{ "ro.build.type", "userdebug" },
 	{ "sys.usb.controller", "a600000.dwc3" },
 	{ "ro.boot.usbcontroller", "a600000.dwc3" },
 	{ "vendor.usb.controller", "a600000.dwc3" },
+	{ "wifi.interface", "wlan0" },
+	{ "ro.hardware", "qcom" },
+	{ "ro.board.platform", "sm6125" },
+	{ "ro.vendor.product.device", "willow" },
+	{ "ro.boot.hardware", "qcom" },
+	{ "ro.vendor.wlan.chip", "qca6174" },
+	/* Corrected to the real captured values (MEMORY.md §7.4, live getprop on
+	 * the working ROM) — the old "2"/"vendor.peripheral.modem.ready=1" pair
+	 * was invented/mismatched: the real property is named
+	 * vendor.peripheral.modem.state (not .ready) with value ONLINE, and
+	 * vendor.wlan.driver.version is a real version string, not "2". Also
+	 * added the previously entirely-missing vendor.wlan.firmware.version.
+	 * Whether anything in cnss-daemon's dependency chain actually reads
+	 * these was unverified when found (§7.4) and still is — cheap,
+	 * correctness-improving regardless of whether it changes behavior. */
+	{ "vendor.wlan.driver.version", "5.2.022.12B" },
+	{ "vendor.wlan.firmware.version", "FW:3.0.2.0.656.1 HW:HW_VERSION=40670000." },
+	{ "vendor.peripheral.modem.state", "ONLINE" },
+	{ "ro.boot.wificountrycode", "00" },
+	{ "persist.vendor.wlan.enable", "1" },
+	{ "init.svc.cnss-daemon", "running" },
+	{ "init.svc.hwservicemanager", "running" },
+	{ "init.svc.vendor.qrtr-ns", "running" },
+	{ "init.svc.vendor.pd_mapper", "running" },
+	{ "vendor.wlan.driver.status", "ok" },
+	{ "vendor.qrtr.enable", "1" },
+	{ "ro.vendor.qti.soc_model", "SM6125" },
+	{ "ro.vendor.qti.soc_id", "400" },
+	{ "persist.vendor.radio.atfwd.start", "true" },
 	{ 0, 0 }
 };
 

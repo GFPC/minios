@@ -9,7 +9,10 @@
 
 static const char *fw_search[] = {
     "/lib/firmware/",
+    "/firmware/image/",
     "/vendor/firmware/",
+    "/vendor/firmware_mnt/image/",
+    "/lib/firmware/vendor_mnt/image/",
     NULL,
 };
 
@@ -73,8 +76,12 @@ static int serve_one(const char *load_path)
             break;
         }
     }
-    if (!src)
+    if (!src) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "missing %s", name);
+        kmsg(msg);
         return 0;
+    }
 
     int ffd = open(src, O_RDONLY);
     if (ffd < 0)
@@ -160,7 +167,7 @@ static void scan_dir(const char *path, int depth)
 
 static void helper_loop(void)
 {
-    for (int i = 0; i < 600; i++) {
+    for (;;) {
         scan_dir("/sys/devices", 0);
         usleep(100000);
     }

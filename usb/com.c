@@ -1,12 +1,15 @@
 #define _GNU_SOURCE
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <linux/reboot.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/reboot.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -15,6 +18,7 @@
 #include "minios/com.h"
 #include "minios/devnodes.h"
 #include "minios/log.h"
+#include "minios/plog.h"
 #include "minios/radio.h"
 #include "minios/usb.h"
 #include "minios/watchdog.h"
@@ -34,27 +38,97 @@ void com_dmesg_tail(int out, int max_lines)
         write(out, "no kmsg\r\n", 9);
         return;
     }
-    char buf[65536];
-    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    /* A fresh /dev/kmsg fd's read cursor starts at the OLDEST record still
+     * in the kernel ring buffer, not the newest — reading sequentially
+     * forward from there. The old 64KB cap here was smaller than this
+     * kernel's actual printk buffer (CONFIG_LOG_BUF_SHIFT=17 -> 128KB), so
+     * once boot had produced more than 64KB of log lines (trivially true
+     * within seconds once the known USB-PHY-drop-during-wlan-power-on
+     * reconnect spam starts), this loop always exhausted its buffer on old
+     * messages and could NEVER reach anything logged after that point —
+     * every "dmesg" this session silently showed only early boot lines
+     * regardless of how much later, more relevant content existed.  Size
+     * this comfortably larger than the kernel's own buffer so a full read
+     * always reaches the true current end. */
+    /* Must be >= kernel log_buf_len (8M, see scripts/build-minios-hybrid.sh
+     * cmdline) or a full read can again fall short of the true current end,
+     * same class of bug this function's own comment already describes once
+     * (256KB was already too small the first time this was "fixed"). */
+    static char buf[8 * 1024 * 1024 + 4096];
+    size_t total = 0;
+    while (total < sizeof(buf) - 1000) {
+        ssize_t n = read(fd, buf + total, 1000);
+        if (n <= 0)
+            break;
+        total += (size_t)n;
+    }
     close(fd);
-    if (n <= 0) {
+    if (total == 0) {
         write(out, "kmsg empty\r\n", 12);
         return;
     }
-    buf[n] = '\0';
+    buf[total] = '\0';
     int lines = 0;
-    for (char *p = buf + n - 1; p >= buf && lines < max_lines; p--) {
+    for (char *p = buf + total - 1; p >= buf && lines < max_lines; p--) {
         if (*p == '\n') {
             lines++;
             if (lines == max_lines) {
-                write(out, p + 1, (size_t)(buf + n - (p + 1)));
+                write(out, p + 1, total - (size_t)(p + 1 - buf));
                 break;
             }
         }
     }
     if (lines < max_lines)
-        write(out, buf, (size_t)n);
+        write(out, buf, total);
     write(out, "\r\n", 2);
+}
+
+void com_dmesg_find(int out, const char *needle, int max_matches)
+{
+    int fd = open("/dev/kmsg", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) {
+        write(out, "no kmsg\r\n", 9);
+        return;
+    }
+    /* Must be >= kernel log_buf_len (8M, see scripts/build-minios-hybrid.sh
+     * cmdline) or a full read can again fall short of the true current end,
+     * same class of bug this function's own comment already describes once
+     * (256KB was already too small the first time this was "fixed"). */
+    static char buf[8 * 1024 * 1024 + 4096];
+    size_t total = 0;
+    while (total < sizeof(buf) - 1000) {
+        ssize_t n = read(fd, buf + total, 1000);
+        if (n <= 0)
+            break;
+        total += (size_t)n;
+    }
+    close(fd);
+    if (total == 0 || !needle || !needle[0]) {
+        write(out, "kmsg empty or no pattern\r\n", 26);
+        return;
+    }
+    buf[total] = '\0';
+    int matches = 0;
+    char *line = buf;
+    while (line < buf + total && matches < max_matches) {
+        char *nl = strchr(line, '\n');
+        size_t linelen = nl ? (size_t)(nl - line) : strlen(line);
+        if (linelen > 0) {
+            char saved = line[linelen];
+            line[linelen] = '\0';
+            if (strstr(line, needle)) {
+                write(out, line, linelen);
+                write(out, "\r\n", 2);
+                matches++;
+            }
+            line[linelen] = saved;
+        }
+        if (!nl)
+            break;
+        line = nl + 1;
+    }
+    if (matches == 0)
+        write(out, "no match\r\n", 10);
 }
 
 void com_read_file_out(int out, const char *path, const char *missing)
@@ -84,9 +158,12 @@ void com_run_cmd_out(int out, const char *cmd)
     if (p == 0) {
         close(pfd[0]);
         dup2(pfd[1], 1);
+        dup2(pfd[1], 2);
         close(pfd[1]);
         setenv("PATH", "/bin:/sbin:/system/bin", 1);
+        execl("/bin/busybox", "busybox", "sh", "-c", cmd, NULL);
         execl("/bin/sh", "sh", "-c", cmd, NULL);
+        perror("execl failed");
         _exit(127);
     }
     close(pfd[1]);
@@ -101,10 +178,14 @@ void com_run_cmd_out(int out, const char *cmd)
 
 int com_handle(int out, const char *line)
 {
+    if (!strncmp(line, "run ", 4)) {
+        com_run_cmd_out(out, line + 4);
+        return 1;
+    }
     if (!strcmp(line, "ping"))
         return write(out, "pong\r\n", 6), 1;
     if (!strcmp(line, "help")) {
-        const char *h = "commands: ping help status usb net drm dmesg kms touch touchmon adb adb-tcp adb-on usb-adb com-on ffslog fb radio wifi bt wifi-scan scan-result metrics poweroff reboot recovery\r\n";
+        const char *h = "commands: ping help status usb net drm dmesg dmesg-find kms touch touchmon adb adb-tcp adb-on usb-adb com-on ffslog fb radio wifi bt wifi-scan scan-result radio-log cnss-log crash-log qrtr-log pd-log icnss-state binder-state catlog qrtr-lookup radio-diag radio-pid radio-ls wifi-fw metrics save-log sync bt-attach modem-state boot-count pstore poweroff reboot recovery mount-debugfs\r\n";
         write(out, h, strlen(h));
         return 1;
     }
@@ -128,6 +209,10 @@ int com_handle(int out, const char *line)
     }
     if (!strcmp(line, "dmesg") || !strncmp(line, "dmesg ", 6)) {
         com_dmesg_tail(out, 40);
+        return 1;
+    }
+    if (!strncmp(line, "dmesg-find ", 11)) {
+        com_dmesg_find(out, line + 11, 200);
         return 1;
     }
     if (!strcmp(line, "kms")) {
@@ -225,6 +310,8 @@ int com_handle(int out, const char *line)
         write(out, "TCP adb :5555 (host: adb connect 192.168.42.129:5555)\r\n", 56);
         pid_t job = fork();
         if (job == 0) {
+            if (usb_enable_ncm() != 0)
+                klog("adb-tcp: NCM enable failed");
             usb_net_setup();
             adb_start_tcp();
             _exit(0);
@@ -249,8 +336,9 @@ int com_handle(int out, const char *line)
             kill(apid, SIGTERM);
         adbd_pid = -1;
         unlink("/tmp/adbd.pid");
-        usleep(200000);
-        write(out, "adb restart pending (reboot)\r\n", 30);
+        usleep(500000);
+        adb_start_tcp();
+        write(out, "adb restarted tcp :5555\r\n", 26);
         return 1;
     }
     if (!strcmp(line, "keys")) {
@@ -341,6 +429,11 @@ int com_handle(int out, const char *line)
             write(out, b, (size_t)n);
         return 1;
     }
+    if (!strcmp(line, "usb-rebind") || !strcmp(line, "usb rebind")) {
+        usb_rebind_request();
+        write(out, "usb rebind requested\r\n", 24);
+        return 1;
+    }
     if (!strcmp(line, "fb") || !strcmp(line, "fastboot")) {
         write(out, "reboot bootloader\r\n", 20);
         sync();
@@ -371,14 +464,24 @@ int com_handle(int out, const char *line)
         reboot(RB_POWER_OFF);
         return 1;
     }
-    if (!strcmp(line, "radio") || !strcmp(line, "wifi") || !strcmp(line, "bt")) {
+    if (!strcmp(line, "wifi") || !strcmp(line, "radio")) {
+        radio_request_wifi_async();
+        char b[512];
+        int n = radio_format_status(b, sizeof(b));
+        if (n > 0)
+            write(out, b, (size_t)n);
+        if (radio_job_running())
+            write(out, "wifi bringup started (COM stays up)\r\n", 37);
+        return 1;
+    }
+    if (!strcmp(line, "bt")) {
         radio_request_async();
         char b[512];
         int n = radio_format_status(b, sizeof(b));
         if (n > 0)
             write(out, b, (size_t)n);
         if (radio_job_running())
-            write(out, "bringup started (COM stays up)\r\n", 32);
+            write(out, "wifi+bt bringup started\r\n", 25);
         return 1;
     }
     if (!strcmp(line, "wifi-scan") || !strcmp(line, "scan")) {
@@ -391,6 +494,217 @@ int com_handle(int out, const char *line)
             write(out, "scan still running...\r\n", 23);
         com_read_file_out(out, "/tmp/wifi-scan.txt",
                           "no scan yet — run: wifi-scan\r\n");
+        return 1;
+    }
+    if (!strcmp(line, "radio-log")) {
+        com_read_file_out(out, "/tmp/radio.log", "no radio log yet\r\n");
+        return 1;
+    }
+    if (!strcmp(line, "cnss-log")) {
+        com_read_file_out(out, "/tmp/cnss.exec.log", "no cnss exec log yet\r\n");
+        return 1;
+    }
+    if (!strcmp(line, "crash-log") || !strcmp(line, "plog")) {
+        /* Widened from 16KB/12000 — the known USB-PHY-drop reconnect spam
+         * (~86ms/line) can fill that whole window in about a second, which
+         * silently hid every earlier, more relevant line (modem PIL
+         * timing, wlfw QMI activity) behind the spam for the rest of the
+         * boot. 64KB buys a much bigger look-back at the cost of a few
+         * more seconds to transmit over the 115200-baud COM link. */
+        static char b[65536];
+        int n = plog_format_tail(b, sizeof(b), sizeof(b) - 64);
+        if (n > 0)
+            write(out, b, (size_t)n);
+        else
+            write(out, "no crash log\r\n", 14);
+        return 1;
+    }
+    if (!strcmp(line, "panic-dmesg")) {
+        com_read_file_out(out, "/sys/fs/pstore/dmesg-ramoops-0", "no pstore dmesg\r\n");
+        return 1;
+    }
+    if (!strcmp(line, "panic-tail")) {
+        /* Read last 8KB of dmesg-ramoops-0 — this is where the panic backtrace is */
+        const char *path = "/sys/fs/pstore/dmesg-ramoops-0";
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) {
+            write(out, "no pstore dmesg\r\n", 17);
+        } else {
+            off_t sz = lseek(fd, 0, SEEK_END);
+            off_t tail = (sz > 8192) ? sz - 8192 : 0;
+            lseek(fd, tail, SEEK_SET);
+            char buf[8192];
+            ssize_t n = read(fd, buf, sizeof(buf));
+            close(fd);
+            if (n > 0)
+                write(out, buf, (size_t)n);
+            else
+                write(out, "empty pstore\r\n", 14);
+        }
+        return 1;
+    }
+    if (!strcmp(line, "console-ramoops")) {
+        com_read_file_out(out, "/sys/fs/pstore/console-ramoops-0", "no pstore console\r\n");
+        return 1;
+    }
+    if (!strcmp(line, "qrtr-log")) {
+        com_read_file_out(out, "/tmp/qrtr-ns.log", "no qrtr log yet\r\n");
+        return 1;
+    }
+    if (!strcmp(line, "pd-log")) {
+        com_read_file_out(out, "/tmp/pd-mapper.log", "no pd-mapper log yet\r\n");
+        return 1;
+    }
+    if (!strcmp(line, "icnss-state")) {
+        char b[4096];
+        int n = radio_format_icnss(b, sizeof(b));
+        if (n > 0)
+            write(out, b, (size_t)n);
+        return 1;
+    }
+    /* mount-debugfs: diagnose why /sys/kernel/debug/icnss/state is
+     * unreachable — is "debugfs" even a registered VFS filesystem type on
+     * this kernel (CONFIG_DEBUG_FS), or is the early mount() in main.c
+     * failing for some other, live-fixable reason (timing, existing
+     * mountpoint, permission)? Reports /proc/filesystems' debugfs line
+     * plus a fresh mount() attempt with errno. */
+    if (!strcmp(line, "mount-debugfs")) {
+        char b[2048];
+        int n = 0;
+        int fd = open("/proc/filesystems", O_RDONLY);
+        if (fd >= 0) {
+            char chunk[1024];
+            ssize_t r = read(fd, chunk, sizeof(chunk) - 1);
+            close(fd);
+            if (r > 0) {
+                chunk[r] = '\0';
+                int has = strstr(chunk, "debugfs") != NULL;
+                n += snprintf(b + n, sizeof(b) - (size_t)n,
+                              "/proc/filesystems has debugfs: %s\r\n",
+                              has ? "YES" : "NO");
+            }
+        } else {
+            n += snprintf(b + n, sizeof(b) - (size_t)n,
+                          "/proc/filesystems open failed errno=%d\r\n", errno);
+        }
+        mkdir("/sys/kernel/debug", 0755);
+        errno = 0;
+        int rc = mount("debugfs", "/sys/kernel/debug", "debugfs", 0, NULL);
+        n += snprintf(b + n, sizeof(b) - (size_t)n,
+                      "fresh mount() rc=%d errno=%d (%s)\r\n",
+                      rc, errno, strerror(errno));
+        n += snprintf(b + n, sizeof(b) - (size_t)n,
+                      "/sys/kernel/debug exists: %s\r\n",
+                      access("/sys/kernel/debug", F_OK) == 0 ? "yes" : "no");
+        n += snprintf(b + n, sizeof(b) - (size_t)n,
+                      "/sys/kernel/debug/icnss exists: %s\r\n",
+                      access("/sys/kernel/debug/icnss", F_OK) == 0 ? "yes" : "no");
+        write(out, b, (size_t)n);
+        return 1;
+    }
+    if (!strcmp(line, "binder-state")) {
+        char b[2048];
+        int n = radio_format_binder(b, sizeof(b));
+        if (n > 0)
+            write(out, b, (size_t)n);
+        return 1;
+    }
+    /* catlog <name>: dump the tail of /tmp/<name>.log — start_vendor_daemon()
+     * redirects each daemon's stdout/stderr there, so this shows exactly why
+     * e.g. hwservicemanager exited instead of just that it isn't running. */
+    if (!strncmp(line, "catlog ", 7)) {
+        char path[192];
+        char b[2048];
+        int n;
+        snprintf(path, sizeof(path), "/tmp/%s.log", line + 7);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) {
+            n = snprintf(b, sizeof(b), "no %s (errno=%d)\r\n", path, errno);
+        } else {
+            off_t sz = lseek(fd, 0, SEEK_END);
+            off_t start = sz > (off_t)sizeof(b) - 64 ? sz - ((off_t)sizeof(b) - 64) : 0;
+            lseek(fd, start, SEEK_SET);
+            ssize_t r = read(fd, b, sizeof(b) - 64);
+            close(fd);
+            n = r > 0 ? (int)r : snprintf(b, sizeof(b), "%s empty\r\n", path);
+        }
+        write(out, b, (size_t)n);
+        return 1;
+    }
+    /* qrtr-lookup [service_hex]: runs /sbin/qrtr_lookup (raw AF_QIPCRTR
+     * client — see tools/qrtr_lookup.c) synchronously and returns its
+     * output. Defaults to 0x45 (wlfw) if no service given. This exists
+     * because /proc/net/qrtr does NOT exist on this kernel (confirmed by
+     * reading kernel/net/qrtr/qrtr.c directly — no proc_create/debugfs
+     * anywhere in it), so wait_for_wlfw()/qrtr_has_wlfw() checking that
+     * path in wlan.c have never been able to actually detect anything —
+     * this is the real replacement check. */
+    if (!strcmp(line, "qrtr-lookup") || !strncmp(line, "qrtr-lookup ", 12)) {
+        const char *svc = line[11] == ' ' ? line + 12 : "45";
+        char path[64];
+        snprintf(path, sizeof(path), "/tmp/qrtr-lookup.txt");
+        pid_t p = fork();
+        if (p == 0) {
+            int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd >= 0) {
+                dup2(fd, 1);
+                dup2(fd, 2);
+                close(fd);
+            }
+            execl("/sbin/qrtr_lookup", "qrtr_lookup", svc, "8", NULL);
+            dprintf(2, "execl qrtr_lookup failed errno=%d\n", errno);
+            _exit(127);
+        }
+        if (p > 0) {
+            int st = 0;
+            waitpid(p, &st, 0);
+        }
+        char b[2048];
+        int fd = open(path, O_RDONLY);
+        int n;
+        if (fd < 0) {
+            n = snprintf(b, sizeof(b), "qrtr-lookup: no output file\r\n");
+        } else {
+            ssize_t r = read(fd, b, sizeof(b) - 1);
+            close(fd);
+            n = r > 0 ? (int)r : snprintf(b, sizeof(b), "qrtr-lookup: empty output\r\n");
+        }
+        write(out, b, (size_t)n);
+        return 1;
+    }
+    if (!strcmp(line, "radio-diag")) {
+        char b[4096];
+        int n = radio_format_diag(b, sizeof(b));
+        if (n > 0)
+            write(out, b, (size_t)n);
+        return 1;
+    }
+    if (!strcmp(line, "radio-pid")) {
+        char b[2048];
+        int n = radio_format_pidinfo(b, sizeof(b));
+        if (n > 0)
+            write(out, b, (size_t)n);
+        return 1;
+    }
+    if (!strcmp(line, "wifi-fw")) {
+        char b[2048];
+        int n = radio_format_fw_list(b, sizeof(b));
+        if (n > 0)
+            write(out, b, (size_t)n);
+        return 1;
+    }
+    if (!strcmp(line, "radio-ls")) {
+        char b[4096];
+        int n = radio_format_src_list(b, sizeof(b));
+        if (n > 0)
+            write(out, b, (size_t)n);
+        return 1;
+    }
+    if (!strncmp(line, "radio-find ", 11)) {
+        char b[4096];
+        int n = radio_format_find(line + 11, b, sizeof(b));
+        if (n > 0)
+            write(out, b, (size_t)n);
         return 1;
     }
     if (!strcmp(line, "metrics") || !strcmp(line, "top")) {
@@ -426,6 +740,161 @@ int com_handle(int out, const char *line)
             write(out, "no metrics\r\n", 12);
         return 1;
     }
+    /* save-log: copy /tmp radio/cnss/qrtr logs to SD persistent storage */
+    if (!strcmp(line, "save-log") || !strcmp(line, "sd-log")) {
+        plog_save_tmp_logs();
+        plog_save_pstore();
+        const char *path = plog_path();
+        char b[256];
+        int n;
+        if (path && path[0])
+            n = snprintf(b, sizeof(b), "saved logs to %s\r\n", path);
+        else
+            n = snprintf(b, sizeof(b), "no SD storage — logs only in /tmp\r\n");
+        if (n > 0) write(out, b, (size_t)n);
+        return 1;
+    }
+    /* sync: flush all filesystem write caches — run this before physically
+     * pulling the SD card. Without it, the FAT32 metadata can be mid-write
+     * on the card and every hard removal risks corruption (needed chkdsk
+     * /f repeatedly in practice before this command existed). */
+    if (!strcmp(line, "sync")) {
+        plog_save_tmp_logs();
+        sync();
+        write(out, "synced — safe to remove SD now\r\n", 33);
+        return 1;
+    }
+    if (!strcmp(line, "boot-count")) {
+        write(out, "boot-count:\r\n", 13);
+        com_run_cmd_out(out, "grep 'BOOT #' /mnt/sdcard/minios/boot.log 2>/dev/null "
+                              "|| grep 'BOOT #' /mnt/persist/minios/boot.log 2>/dev/null "
+                              "|| echo no_boot_log");
+        return 1;
+    }
+    if (!strcmp(line, "pstore")) {
+        plog_save_pstore();
+        /* List pstore files */
+        com_run_cmd_out(out, "ls -la /sys/fs/pstore/ 2>/dev/null");
+        /* Read files directly in C — busybox 'test' not available */
+        {
+            const char *ps_files[] = {
+                "/sys/fs/pstore/dmesg-ramoops-0",
+                "/sys/fs/pstore/dmesg-ramoops-1",
+                "/sys/fs/pstore/console-ramoops-0",
+                NULL
+            };
+            for (int pi = 0; ps_files[pi]; pi++) {
+                int pfd = open(ps_files[pi], O_RDONLY);
+                if (pfd < 0)
+                    continue;
+                {
+                    char hdr[128];
+                    int hn = snprintf(hdr, sizeof(hdr), "\r\n=== %s (last 40KB) ===\r\n", ps_files[pi]);
+                    if (hn > 0) write(out, hdr, (size_t)hn);
+                }
+                /* Seek to last 40KB — panic backtrace is at end */
+                off_t sz = lseek(pfd, 0, SEEK_END);
+                off_t tail_off = (sz > 40960) ? sz - 40960 : 0;
+                lseek(pfd, tail_off, SEEK_SET);
+                
+                char buf[4096];
+                ssize_t n;
+                while ((n = read(pfd, buf, sizeof(buf))) > 0) {
+                    write(out, buf, (size_t)n);
+                    wdt_pet();
+                }
+                close(pfd);
+            }
+        }
+        write(out, "\r\n", 2);
+        return 1;
+    }
+    /* bt-attach: manually trigger hciattach on UART BT */
+    if (!strcmp(line, "bt-attach")) {
+        write(out, "hciattach /dev/ttyHS0 qca 3000000...\r\n", 38);
+        pid_t p = fork();
+        if (p == 0) {
+            int null = open("/dev/null", O_RDONLY);
+            if (null >= 0) { dup2(null, 0); close(null); }
+            int lfd = open("/tmp/hciattach.log",
+                           O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (lfd >= 0) { dup2(lfd, 1); dup2(lfd, 2); close(lfd); }
+            execl("/sbin/hciattach", "hciattach",
+                  "-n", "/dev/ttyHS0", "qca", "3000000", "flow", NULL);
+            execl("/sbin/hciattach", "hciattach",
+                  "-n", "/dev/ttyHS0", "any", "115200", NULL);
+            _exit(127);
+        }
+        if (p > 0) {
+            write(out, "hciattach started — check: crash-log\r\n", 39);
+        } else {
+            write(out, "fork failed\r\n", 14);
+        }
+        return 1;
+    }
+    /* modem-state: quick subsys0 + wlfw + ICNSS FW_READY status */
+    if (!strcmp(line, "modem-state")) {
+        char b[768];
+        int n = 0;
+        /* subsys state */
+        char st[32] = "?";
+        {
+            int fd = open("/sys/bus/msm_subsys/devices/subsys0/state", O_RDONLY);
+            if (fd >= 0) {
+                ssize_t r = read(fd, st, sizeof(st) - 1);
+                close(fd);
+                if (r > 0) {
+                    st[r] = '\0';
+                    char *nl = strchr(st, '\n');
+                    if (nl) *nl = '\0';
+                }
+            }
+        }
+        n += snprintf(b + n, sizeof(b) - (size_t)n, "subsys0=%s\r\n", st);
+        /* QRTR wlfw */
+        {
+            int fd = open("/proc/net/qrtr", O_RDONLY);
+            if (fd >= 0) {
+                char qb[2048]; ssize_t r = read(fd, qb, sizeof(qb) - 1);
+                close(fd);
+                if (r > 0) {
+                    qb[r] = '\0';
+                    int has_wlfw = (strstr(qb, " 69 ") || strstr(qb, "0x45")) ? 1 : 0;
+                    n += snprintf(b + n, sizeof(b) - (size_t)n,
+                                  "qrtr_wlfw=%d\r\n", has_wlfw);
+                } else {
+                    n += snprintf(b + n, sizeof(b) - (size_t)n, "qrtr_wlfw=? (empty)\r\n");
+                }
+            } else {
+                n += snprintf(b + n, sizeof(b) - (size_t)n, "qrtr_wlfw=? (no /proc/net/qrtr)\r\n");
+            }
+        }
+        /* ICNSS FW_READY */
+        {
+            char icst[32] = "n/a";
+            int fd = open("/sys/kernel/debug/icnss/state", O_RDONLY);
+            if (fd >= 0) {
+                ssize_t r = read(fd, icst, sizeof(icst) - 1);
+                close(fd);
+                if (r > 0) {
+                    icst[r] = '\0';
+                    char *nl = strchr(icst, '\n');
+                    if (nl) *nl = '\0';
+                }
+            }
+            unsigned long icval = strtoul(icst, NULL, 16);
+            n += snprintf(b + n, sizeof(b) - (size_t)n,
+                          "icnss_state=0x%s fw_ready=%d\r\n",
+                          icst, (icval & 4) ? 1 : 0);
+        }
+        /* wlan0 / hci0 */
+        n += snprintf(b + n, sizeof(b) - (size_t)n,
+                      "wlan0=%s hci0=%s\r\n",
+                      access("/sys/class/net/wlan0", F_OK) == 0 ? "yes" : "no",
+                      access("/sys/class/bluetooth/hci0", F_OK) == 0 ? "yes" : "no");
+        if (n > 0) write(out, b, (size_t)n);
+        return 1;
+    }
     return 0;
 }
 
@@ -441,7 +910,20 @@ void com_shell(int fd)
         char c;
         ssize_t n = read(fd, &c, 1);
         if (n <= 0) {
-            usleep(50000);
+            /* f_cdev_read() (kernel/drivers/usb/gadget/function/f_cdev.c)
+             * unconditionally calls usb_cser_start_rx() at the end of
+             * every single read(), even ones that return no data — on
+             * this board that re-arm attempt fails every time
+             * ("usb ep(ep1out) queue failed", real kernel-level cause not
+             * yet fixed). Polling read() every 50ms turned that into a
+             * continuous, unbounded retry (confirmed via a direct SD-card
+             * boot.log read: tens of thousands of repeats in a single
+             * boot, every ~50ms, never stopping) — real CPU/log overhead
+             * on top of the cosmetic spam, and a plausible contributor to
+             * this session's own COM-channel flakiness. Back off the poll
+             * interval substantially; still fine for an interactive debug
+             * console, and cuts the retry rate by ~5x. */
+            usleep(250000);
             continue;
         }
         if (c == '\r' || c == '\n') {

@@ -1,299 +1,278 @@
 #define _GNU_SOURCE
 #include "radio.h"
-#include "blockdev.h"
+#include "minios/log.h"
+#include "minios/watchdog.h"
+#include "minios/plog.h"
+#include "radio_utils.h"
+#include "modem.h"
+#include "cnss.h"
+#include "wlan.h"
+#include "bt.h"
+#include "firmware.h"
 #include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
+#include <errno.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+#include <sys/un.h>
 #include <unistd.h>
+#include <linux/capability.h>
+#include <sys/syscall.h>
 
-static char wifi_st[80] = "WiFi: idle";
-static char bt_st[80] = "BT: idle";
-static int vendor_mounted;
-static int persist_mounted;
-static int modem_mounted;
-static int bt_fw_mounted;
-static pid_t radio_pid;
-static pid_t scan_pid;
+#ifndef SYS_capset
+#define SYS_capset 90
+#endif
+#ifndef SYS_finit_module
+#if defined(__aarch64__)
+#define SYS_finit_module 379
+#elif defined(__arm__)
+#define SYS_finit_module 380
+#else
+#define SYS_finit_module 313
+#endif
+#endif
+#ifndef MODULE_INIT_IGNORE_VERMAGIC
+#define MODULE_INIT_IGNORE_VERMAGIC 1
+#endif
+#ifndef MODULE_INIT_IGNORE_MODVERSIONS
+#define MODULE_INIT_IGNORE_MODVERSIONS 2
+#endif
 
-static void klog(const char *s)
+#define CNSS_EXEC_LOG "/tmp/cnss.exec.log"
+#define CNSS_BUILD_TAG "cnss-start v37-TESTMARK no-rproc"
+#define WLAN_FWPATH_MAX 18
+
+#define BT_CMD_PWR_CTRL 0xbfad
+
+char wifi_st[80] = "WiFi: idle";
+char bt_st[80] = "BT: idle";
+int vendor_mounted;
+int system_mounted;
+int persist_mounted;
+int modem_mounted;
+int bt_fw_mounted;
+pid_t radio_pid;
+pid_t scan_pid;
+pid_t cnss_qrtr_pid;
+pid_t cnss_pdmap_pid;
+pid_t cnss_daemon_pid;
+int radio_job_bt;
+
+static void write_radio_log_mode(int append);
+
+
+
+
+
+
+/* Stock adsp-loader: sscanf "%du" → "1u"; patched kernel: "%d" → "1". Try both. */
+
+
+
+
+
+
+
+
+
+
+
+
+
+const char *pick_wlan_fwpath(void)
 {
-    int fd = open("/dev/kmsg", O_WRONLY);
-    if (fd >= 0) {
-        char b[192];
-        int n = snprintf(b, sizeof(b), "<6>radio: %s\n", s);
-        if (n > 0)
-            (void)write(fd, b, n);
-        close(fd);
-    }
-}
-
-static void klogf2(const char *a, const char *b)
-{
-    char msg[160];
-    snprintf(msg, sizeof(msg), "%s %s", a, b);
-    klog(msg);
-}
-
-static void wf(const char *path, const char *val)
-{
-    int fd = open(path, O_WRONLY);
-    if (fd >= 0) {
-        write(fd, val, strlen(val));
-        close(fd);
-    }
-}
-
-static void md(const char *p)
-{
-    mkdir(p, 0755);
-}
-
-static void run_sh(const char *cmd)
-{
-    pid_t p = fork();
-    if (p == 0) {
-        setenv("PATH", "/bin:/sbin", 1);
-        execl("/bin/sh", "sh", "-c", cmd, NULL);
-        _exit(127);
-    }
-    if (p > 0)
-        waitpid(p, NULL, 0);
-}
-
-static int path_exists(const char *p)
-{
-    return access(p, F_OK) == 0;
-}
-
-static int pid_alive(pid_t p)
-{
-    return p > 0 && kill(p, 0) == 0;
-}
-
-static int try_mount_ro(const char *src, const char *dst, const char *fstype)
-{
-    md(dst);
-    if (mount(src, dst, fstype, MS_RDONLY, NULL) == 0) {
-        klogf2("mounted", dst);
-        return 0;
-    }
-    return -1;
-}
-
-static int try_mount_part(const char *part, const char *dst, const char *fstype)
-{
-    const char *dev = blockdev_by_name(part);
-    if (!dev)
-        return -1;
-    return try_mount_ro(dev, dst, fstype);
-}
-
-static void ensure_block_layout(void)
-{
-    blockdev_ensure_by_name();
-    md("/vendor");
-    md("/vendor/firmware_mnt");
-    md("/vendor/bt_firmware");
-    md("/mnt/vendor/persist");
-    md("/persist");
-}
-
-static void mount_radio_partitions(void)
-{
-    if (!vendor_mounted) {
-        if (try_mount_part("vendor", "/vendor", "ext4") == 0 ||
-            try_mount_part("vendor_a", "/vendor", "ext4") == 0 ||
-            try_mount_part("vendor", "/vendor", "erofs") == 0)
-            vendor_mounted = 1;
-    }
-    if (!modem_mounted && try_mount_part("modem", "/vendor/firmware_mnt", "vfat") == 0)
-        modem_mounted = 1;
-    if (!bt_fw_mounted && try_mount_part("bluetooth", "/vendor/bt_firmware", "vfat") == 0)
-        bt_fw_mounted = 1;
-    if (!persist_mounted && try_mount_part("persist", "/mnt/vendor/persist", "ext4") == 0) {
-        persist_mounted = 1;
-        if (!path_exists("/persist/WCNSS_qcom_wlan_nv.bin"))
-            run_sh("cp -a /mnt/vendor/persist/. /persist/ 2>/dev/null");
-    }
-}
-
-static void symlink_if_missing(const char *target, const char *linkpath)
-{
-    if (!path_exists(target) || path_exists(linkpath))
-        return;
-    unlink(linkpath);
-    symlink(target, linkpath);
-}
-
-static void link_firmware_tree(void)
-{
-    const char *pairs[] = {
-        "/vendor/firmware", "/lib/firmware/vendor",
-        "/vendor/firmware_mnt", "/lib/firmware/vendor_mnt",
-        "/vendor/bt_firmware", "/lib/firmware/bt_firmware",
-        "/vendor/firmware/wlan", "/lib/firmware/wlan/vendor",
-        NULL, NULL
+    static const char *candidates[] = {
+        "/vendor/etc/wifi",
+        "/data/misc/wifi",
+        NULL
     };
 
-    md("/lib/firmware/wlan/qca_cld");
-    for (int i = 0; pairs[i]; i += 2)
-        symlink_if_missing(pairs[i], pairs[i + 1]);
+    for (int i = 0; candidates[i]; i++) {
+        char ini[256];
 
-    symlink_if_missing("/vendor/etc/wifi/WCNSS_qcom_cfg.ini",
-                       "/lib/firmware/wlan/qca_cld/WCNSS_qcom_cfg.ini");
-    symlink_if_missing("/mnt/vendor/persist/WCNSS_qcom_wlan_nv.bin",
-                       "/lib/firmware/wlan/qca_cld/WCNSS_qcom_wlan_nv.bin");
-    symlink_if_missing("/persist/WCNSS_qcom_wlan_nv.bin",
-                       "/lib/firmware/wlan/qca_cld/WCNSS_qcom_wlan_nv.bin");
-    symlink_if_missing("/vendor/firmware_mnt/wlan_mac.bin",
-                       "/lib/firmware/wlan/qca_cld/wlan_mac.bin");
-    symlink_if_missing("/vendor/bt_firmware/image/crbtfw21.tlv",
-                       "/lib/firmware/qca/crbtfw21.tlv");
-    symlink_if_missing("/vendor/bt_firmware/image/crnv21.bin",
-                       "/lib/firmware/qca/crnv21.bin");
-}
-
-static int dir_has_files(const char *path)
-{
-    DIR *d = opendir(path);
-    struct dirent *e;
-
-    if (!d)
-        return 0;
-    while ((e = readdir(d))) {
-        if (e->d_name[0] == '.')
+        if (strlen(candidates[i]) > WLAN_FWPATH_MAX)
             continue;
-        closedir(d);
-        return 1;
+        if (strcmp(candidates[i], "/data/misc/wifi") == 0)
+            ensure_wifi_config();
+        snprintf(ini, sizeof(ini), "%s/WCNSS_qcom_cfg.ini", candidates[i]);
+        if (path_exists(ini))
+            return candidates[i];
     }
-    closedir(d);
-    return 0;
+    return NULL;
 }
 
-static int has_wlan_firmware(void)
+/* Try to read ICNSS_FW_READY bit (bit 2 = 0x4) from debugfs state.
+ * Returns 1 if confirmed ready, 0 if not readable / not set. */
+
+/* Wait up to max_sec for ICNSS_FW_READY.  Falls through whether or not
+ * the bit is detected (debugfs may not have the entry). */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+const char *vendor_bin(const char *name)
 {
-    static const char *paths[] = {
-        "/lib/firmware/wlan/qca_cld",
-        "/lib/firmware/vendor/firmware/wlan/qca_cld",
-        "/vendor/firmware/wlan/qca_cld",
+    static char paths[5][128];
+    static int idx;
+    static const char *prefixes[] = {
+        "/mnt/vendor/bin/",
+        "/vendor/bin/",
+        "/vendor/bin/hw/",
+        "/system/bin/",
+        "/system/vendor/bin/",
+        "/sbin/",
         NULL
     };
 
-    for (int i = 0; paths[i]; i++) {
-        if (dir_has_files(paths[i]))
-            return 1;
+    for (int i = 0; prefixes[i]; i++) {
+        idx = (idx + 1) % 5;
+        snprintf(paths[idx], sizeof(paths[idx]), "%s%s", prefixes[i], name);
+        if (path_exists(paths[idx]))
+            return paths[idx];
     }
-    return 0;
+    return NULL;
 }
 
-static void rfkill_unblock_all(void)
+
+
+
+const char *stage_cnss_daemon(const char *src)
 {
-    run_sh("for f in /sys/class/rfkill/rfkill*/state; do "
-           "[ -f \"$f\" ] && echo 1 > \"$f\" 2>/dev/null; done");
+    static char staged[128];
+    char msg[256];
+    int rc;
+
+    if (!src || !path_exists(src))
+        return src;
+    snprintf(staged, sizeof(staged), "/tmp/cnss-daemon");
+    unlink(staged);
+    rc = copy_file_bin(src, staged);
+    snprintf(msg, sizeof(msg), "stage cp %s -> %s rc=%d errno=%d exists=%d",
+             src, staged, rc, rc < 0 ? -rc : 0, path_exists(staged));
+    cnss_log_line(msg);
+    LOGI("radio", "%s", msg);
+    return path_exists(staged) ? staged : src;
 }
 
-static void trigger_wlan_power(void)
-{
-    const char *triggers[] = {
-        "/sys/kernel/boot_wlan/boot_wlan",
-        "/sys/module/wlan/parameters/con_mode",
-        NULL
-    };
 
-    wf("/sys/kernel/shutdown_wlan/shutdown", "0");
-    for (int i = 0; triggers[i]; i++) {
-        if (access(triggers[i], W_OK) == 0)
-            wf(triggers[i], "1");
+
+
+
+
+
+
+
+
+
+
+static char staged_bin_path[128];
+
+const char *stage_vendor_bin(const char *name)
+{
+    const char *src = vendor_bin(name);
+    int rc;
+
+    if (!src)
+        return NULL;
+    if (!strncmp(src, "/vendor/", 8) || !strncmp(src, "/system/", 8)) {
+        snprintf(staged_bin_path, sizeof(staged_bin_path), "/tmp/%s", name);
+        unlink(staged_bin_path);
+        rc = copy_file_bin(src, staged_bin_path);
+        if (rc == 0)
+            chmod(staged_bin_path, 0755);
+        if (path_exists(staged_bin_path))
+            return staged_bin_path;
     }
-    run_sh("for p in /sys/devices/platform/soc/*/wcnss_wlan "
-           "/sys/bus/platform/drivers/icnss*/*/wcnss_wlan; do "
-           "[ -e \"$p\" ] && echo 1 > \"$p\" 2>/dev/null; done");
+    return src;
 }
 
-static void wait_for_iface(const char *sys_path, int sec)
-{
-    for (int i = 0; i < sec * 2; i++) {
-        if (path_exists(sys_path))
-            return;
-        usleep(500000);
-    }
-}
 
-static void try_wlan_enable(void)
-{
-    trigger_wlan_power();
-    wait_for_iface("/sys/class/net/wlan0", 10);
 
-    if (path_exists("/sys/class/net/wlan0")) {
-        run_sh("ip link set wlan0 up 2>/dev/null");
-        char mac[32] = "";
-        int fd = open("/sys/class/net/wlan0/address", O_RDONLY);
-        if (fd >= 0) {
-            char b[32];
-            ssize_t n = read(fd, b, sizeof(b) - 1);
-            close(fd);
-            if (n > 0) {
-                b[n] = '\0';
-                char *nl = strchr(b, '\n');
-                if (nl)
-                    *nl = '\0';
-                snprintf(mac, sizeof(mac), " %s", b);
-            }
-        }
-        snprintf(wifi_st, sizeof(wifi_st), "WiFi: wlan0 up%s", mac);
-        klog("wlan0 up");
-        return;
-    }
 
-    if (has_wlan_firmware())
-        snprintf(wifi_st, sizeof(wifi_st), vendor_mounted ?
-                 "WiFi: fw ok no iface" : "WiFi: fw bundled no iface");
-    else if (vendor_mounted)
-        snprintf(wifi_st, sizeof(wifi_st), "WiFi: vendor no wlan fw");
-    else
-        snprintf(wifi_st, sizeof(wifi_st), "WiFi: need vendor mount");
-}
 
-static void bt_power_on(void)
-{
-    wf("/sys/module/bluetooth_power/parameters/power", "1");
-    run_sh("for f in /sys/class/rfkill/rfkill*/state; do "
-           "[ -f \"$f\" ] && echo 1 > \"$f\" 2>/dev/null; done");
-}
 
-static void try_bt_enable(void)
-{
-    bt_power_on();
-    wait_for_iface("/sys/class/bluetooth/hci0", 8);
 
-    if (path_exists("/sys/class/bluetooth/hci0")) {
-        snprintf(bt_st, sizeof(bt_st), "BT: hci0 up");
-        klog("hci0 up");
-        return;
-    }
-    if (path_exists("/lib/firmware/qca/crbtfw21.tlv") ||
-        path_exists("/vendor/bt_firmware/image/crbtfw21.tlv"))
-        snprintf(bt_st, sizeof(bt_st), bt_fw_mounted ?
-                 "BT: fw ok no hci" : "BT: fw bundled no hci");
-    else if (bt_fw_mounted)
-        snprintf(bt_st, sizeof(bt_st), "BT: bt part empty");
-    else
-        snprintf(bt_st, sizeof(bt_st), "BT: need bt part");
-}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/* PIL request_firmware() looks in /lib/firmware/modem.{mdt,bNN}. */
+
+
+
+
+
+
+
+
+
 
 static void write_radio_log(void)
 {
-    int fd = open("/tmp/radio.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    write_radio_log_mode(0);
+}
+
+void write_radio_log_append(void)
+{
+    write_radio_log_mode(1);
+}
+
+static void write_radio_log_mode(int append)
+{
+    int fd = open("/tmp/radio.log", O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC), 0644);
     if (fd < 0)
         return;
-    dprintf(fd, "vendor=%d persist=%d modem=%d bt_fw=%d wlan_fw=%d\n",
-            vendor_mounted, persist_mounted, modem_mounted, bt_fw_mounted,
+    dprintf(fd, "vendor=%d system=%d persist=%d modem=%d bt_fw=%d wlan_fw=%d\n",
+            vendor_mounted, system_mounted, persist_mounted, modem_mounted, bt_fw_mounted,
             has_wlan_firmware());
+    dprintf(fd, "cnss qrtr=%d pdmap=%d daemon=%d vndksupport=%d\n",
+            proc_running("qrtr-ns"), proc_running("pd-mapper"),
+            proc_running("cnss-daemon"), path_exists("/lib64/libvndksupport.so"));
+    {
+        char diag[2048];
+        blockdev_format_diag(diag, sizeof(diag));
+        write(fd, diag, strlen(diag));
+    }
     close(fd);
 }
 
@@ -306,18 +285,49 @@ static void write_radio_status(void)
     }
 }
 
-static void radio_work(void)
+static void radio_prepare(void)
 {
-    klog("bringup start");
     ensure_block_layout();
     rfkill_unblock_all();
+    /* Mount debugfs so icnss/state is readable for FW_READY polling. */
+    ensure_debugfs();
     mount_radio_partitions();
     link_firmware_tree();
     write_radio_log();
+}
+
+
+
+
+
+
+static void radio_work(void)
+{
+    LOGI("radio", "%s", "bringup start");
+    radio_prepare();
+    /* Start RMTFS serving (rmt_storage/tftp_server) right after mounts are
+     * ready, before the cnss stack / modem PIL trigger — real ROM has these
+     * listening from very early boot, well before modem PIL; the modem's
+     * own software starts polling RMTFS immediately on leaving reset. See
+     * start_rmtfs_daemons_early()'s own comment in modem.c. */
+    start_rmtfs_daemons_early();
+    /* Let USB/COM settle before RF power (reduces dwc3 drop). */
+    usleep(800000);
     try_wlan_enable();
-    try_bt_enable();
     write_radio_status();
-    klog("bringup done");
+
+    if (radio_job_bt) {
+        usleep(1500000);
+        try_bt_enable();
+        write_radio_status();
+    } else {
+        snprintf(bt_st, sizeof(bt_st), "BT: skipped (wifi job)");
+    }
+
+    /* Always persist all runtime logs to SD at the end of radio bringup */
+    plog_save_tmp_logs();
+
+    LOGI("radio", "%s", "bringup done");
 }
 
 static void scan_work(void)
@@ -326,11 +336,40 @@ static void scan_work(void)
     if (fd >= 0)
         close(fd);
 
+    LOGI("radio", "%s", "scan start");
     if (!path_exists("/sys/class/net/wlan0")) {
-        run_sh("echo 'wlan0 down — run: radio' > /tmp/wifi-scan.txt");
+        radio_prepare();
+        usleep(800000);
+        try_wlan_enable();
+    }
+
+    if (!path_exists("/sys/class/net/wlan0")) {
+        int fd = open("/tmp/wifi-scan.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            dprintf(fd, "wlan0 down — check: status (vendor mount + fw)\n");
+            close(fd);
+        }
+        LOGI("radio", "%s", "scan: no wlan0");
         return;
     }
-    run_sh("/sbin/wlan_scan > /tmp/wifi-scan.txt 2>&1");
+
+    {
+        pid_t p = fork();
+        if (p == 0) {
+            int out = open("/tmp/wifi-scan.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            radio_child_setup();
+            if (out >= 0) {
+                dup2(out, 1);
+                dup2(out, 2);
+                close(out);
+            }
+            execl("/sbin/wlan_scan", "wlan_scan", NULL);
+            _exit(127);
+        }
+        if (p > 0)
+            waitpid(p, NULL, 0);
+    }
+    LOGI("radio", "%s", "scan done");
 }
 
 static void start_job(pid_t *slot, void (*fn)(void))
@@ -343,28 +382,64 @@ static void start_job(pid_t *slot, void (*fn)(void))
             *slot = p;
         return;
     }
+    radio_child_setup();
     fn();
     _exit(0);
 }
 
+static void start_radio_job(int with_bt)
+{
+    if (pid_alive(radio_pid))
+        return;
+    if (pid_alive(scan_pid))
+        return;
+    radio_job_bt = with_bt;
+    start_job(&radio_pid, radio_work);
+}
+
+void radio_request_wifi_async(void)
+{
+    start_radio_job(0);
+}
+
 void radio_request_async(void)
 {
-    start_job(&radio_pid, radio_work);
+    start_radio_job(1);
 }
 
 void radio_init_async(void)
 {
-    radio_request_async();
+    radio_request_wifi_async();
+}
+
+void modem_qmi_services_start(void)
+{
+    start_modem_qmi_services();
 }
 
 void radio_probe_now(void)
 {
-    radio_request_async();
+    radio_request_wifi_async();
 }
 
 void radio_scan_request_async(void)
 {
+    if (pid_alive(radio_pid))
+        return;
     start_job(&scan_pid, scan_work);
+}
+
+static void log_job_exit(const char *name, int st)
+{
+    char msg[96];
+
+    if (WIFSIGNALED(st))
+        snprintf(msg, sizeof(msg), "%s job killed by signal %d", name, WTERMSIG(st));
+    else if (WIFEXITED(st))
+        snprintf(msg, sizeof(msg), "%s job exited status %d", name, WEXITSTATUS(st));
+    else
+        snprintf(msg, sizeof(msg), "%s job ended st=0x%x", name, st);
+    LOGI("radio", "%s", msg);
 }
 
 void radio_poll(void)
@@ -374,13 +449,17 @@ void radio_poll(void)
 
     if (radio_pid > 0) {
         p = waitpid(radio_pid, &st, WNOHANG);
-        if (p == radio_pid)
+        if (p == radio_pid) {
+            log_job_exit("radio", st);
             radio_pid = 0;
+        }
     }
     if (scan_pid > 0) {
         p = waitpid(scan_pid, &st, WNOHANG);
-        if (p == scan_pid)
+        if (p == scan_pid) {
+            log_job_exit("scan", st);
             scan_pid = 0;
+        }
     }
 }
 
@@ -439,4 +518,408 @@ int radio_format_status(char *buf, size_t bufsz)
                     path_exists("/sys/class/bluetooth/hci0") ? "yes" : "no",
                     radio_job_running() ? "running" : "idle",
                     radio_scan_running() ? "running" : "idle");
+}
+
+int radio_format_fw_list(char *buf, size_t bufsz)
+{
+    int n = 0;
+    DIR *d = opendir("/lib/firmware/wlan/qca_cld");
+
+    n += snprintf(buf + n, bufsz - (size_t)n, "wifi-fw /lib/firmware/wlan/qca_cld\r\n");
+    if (!d) {
+        n += snprintf(buf + n, bufsz - (size_t)n, "  (missing)\r\n");
+        return n;
+    }
+    struct dirent *e;
+    while ((e = readdir(d)) && n < (int)bufsz - 80) {
+        char target[256];
+        char linkpath[384];
+        ssize_t tl;
+
+        if (e->d_name[0] == '.')
+            continue;
+        snprintf(linkpath, sizeof(linkpath), "/lib/firmware/wlan/qca_cld/%s", e->d_name);
+        tl = readlink(linkpath, target, sizeof(target) - 1);
+        if (tl > 0) {
+            target[tl] = '\0';
+            n += snprintf(buf + n, bufsz - (size_t)n, "  %s -> %s\r\n", e->d_name, target);
+        } else {
+            n += snprintf(buf + n, bufsz - (size_t)n, "  %s\r\n", e->d_name);
+        }
+    }
+    closedir(d);
+    return n;
+}
+
+static int format_dir_entries(const char *dir, char *buf, size_t bufsz, int n)
+{
+    DIR *d = opendir(dir);
+
+    n += snprintf(buf + n, bufsz - (size_t)n, "%s:\r\n", dir);
+    if (!d) {
+        n += snprintf(buf + n, bufsz - (size_t)n, "  (missing)\r\n");
+        return n;
+    }
+    struct dirent *e;
+    int count = 0;
+    while ((e = readdir(d)) && n < (int)bufsz - 64 && count < 32) {
+        if (e->d_name[0] == '.')
+            continue;
+        n += snprintf(buf + n, bufsz - (size_t)n, "  %s\r\n", e->d_name);
+        count++;
+    }
+    closedir(d);
+    if (count >= 32)
+        n += snprintf(buf + n, bufsz - (size_t)n, "  ...\r\n");
+    return n;
+}
+
+static int find_in_dir(const char *dir, const char *needle, char *buf, size_t bufsz, int n)
+{
+    DIR *d = opendir(dir);
+    struct dirent *e;
+
+    if (!d)
+        return n;
+    while ((e = readdir(d)) && n < (int)bufsz - 64) {
+        if (e->d_name[0] == '.')
+            continue;
+        if (strstr(e->d_name, needle))
+            n += snprintf(buf + n, bufsz - (size_t)n, "  %s/%s\r\n", dir, e->d_name);
+    }
+    closedir(d);
+    return n;
+}
+
+int radio_format_pidinfo(char *buf, size_t bufsz)
+{
+    int n = snprintf(buf, bufsz, "radio_pid=%d alive=%d\r\n", (int)radio_pid, pid_alive(radio_pid));
+
+    if (radio_pid <= 0)
+        return n;
+
+    {
+        char path[64];
+        int fd;
+        char rb[512];
+        ssize_t rn;
+
+        snprintf(path, sizeof(path), "/proc/%d/status", (int)radio_pid);
+        fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            rn = read(fd, rb, sizeof(rb) - 1);
+            close(fd);
+            if (rn > 0) {
+                rb[rn] = '\0';
+                char *line = rb;
+                while (line && *line && n < (int)bufsz - 96) {
+                    char *nl = strchr(line, '\n');
+                    if (nl) *nl = '\0';
+                    if (!strncmp(line, "State:", 6) || !strncmp(line, "Name:", 5) ||
+                        !strncmp(line, "PPid:", 5) || !strncmp(line, "Threads:", 8))
+                        n += snprintf(buf + n, bufsz - (size_t)n, "%s\r\n", line);
+                    line = nl ? nl + 1 : NULL;
+                }
+            }
+        } else {
+            n += snprintf(buf + n, bufsz - (size_t)n, "no /proc/%d/status (errno=%d)\r\n",
+                          (int)radio_pid, errno);
+        }
+
+        snprintf(path, sizeof(path), "/proc/%d/wchan", (int)radio_pid);
+        fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            rn = read(fd, rb, sizeof(rb) - 1);
+            close(fd);
+            if (rn > 0) {
+                rb[rn] = '\0';
+                n += snprintf(buf + n, bufsz - (size_t)n, "wchan=%s\r\n", rb);
+            } else {
+                n += snprintf(buf + n, bufsz - (size_t)n, "wchan=(empty, running)\r\n");
+            }
+        }
+
+        snprintf(path, sizeof(path), "/proc/%d/syscall", (int)radio_pid);
+        fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            rn = read(fd, rb, sizeof(rb) - 1);
+            close(fd);
+            if (rn > 0) {
+                rb[rn] = '\0';
+                n += snprintf(buf + n, bufsz - (size_t)n, "syscall=%s\r\n", rb);
+            }
+        }
+    }
+    return n;
+}
+
+int radio_format_find(const char *needle, char *buf, size_t bufsz)
+{
+    static const char *dirs[] = {
+        "/vendor/firmware_mnt/image",
+        "/vendor/firmware/wlan/qca_cld",
+        "/vendor/firmware/wlan",
+        "/lib/firmware/wlan/qca_cld",
+        NULL
+    };
+    int n = snprintf(buf, bufsz, "radio-find %s\r\n", needle ? needle : "");
+
+    if (!needle || !needle[0])
+        return n + snprintf(buf + n, bufsz - (size_t)n, "  (no pattern)\r\n");
+    for (int i = 0; dirs[i] && n < (int)bufsz - 64; i++)
+        n = find_in_dir(dirs[i], needle, buf, bufsz, n);
+    return n;
+}
+
+int radio_format_src_list(char *buf, size_t bufsz)
+{
+    static const char *dirs[] = {
+        "/sbin",
+        "/vendor/bin",
+        "/system/bin",
+        "/vendor/firmware_mnt/image",
+        "/vendor/firmware/wlan/qca_cld",
+        "/vendor/etc/wifi",
+        "/mnt/vendor/persist",
+        "/persist",
+        NULL
+    };
+    int n = snprintf(buf, bufsz, "radio-ls\r\n");
+
+    for (int i = 0; dirs[i] && n < (int)bufsz - 64; i++)
+        n = format_dir_entries(dirs[i], buf, bufsz, n);
+    if (n < (int)bufsz)
+        n += radio_format_fw_list(buf + n, bufsz - (size_t)n);
+    return n;
+}
+
+/* Targeted existence check for the binder context-manager daemons that
+ * cnss-daemon needs on /dev/hwbinder. radio-ls's 4KB buffer truncates
+ * /vendor/bin and /system/bin alphabetically before reaching entries
+ * starting with 'h'/'s', so it can't answer "does hwservicemanager
+ * exist" — this checks the exact candidate paths directly instead. */
+int radio_format_binder(char *buf, size_t bufsz)
+{
+    static const char *prefixes[] = {
+        "/mnt/vendor/bin/", "/vendor/bin/", "/vendor/bin/hw/",
+        "/system/bin/", "/system/vendor/bin/", "/sbin/", NULL
+    };
+    static const char *svcs[] = {
+        "hwservicemanager", "servicemanager", "vndservicemanager", NULL
+    };
+    int n = snprintf(buf, bufsz, "binder-state\r\n");
+
+    n += snprintf(buf + n, bufsz - (size_t)n,
+                  "nodes: binder=%d hwbinder=%d vndbinder=%d ctl=%d\r\n",
+                  path_exists("/dev/binder"), path_exists("/dev/hwbinder"),
+                  path_exists("/dev/vndbinder"),
+                  path_exists("/dev/binderfs/binder-control"));
+    n += snprintf(buf + n, bufsz - (size_t)n,
+                  "binderfs raw: binder=%d hwbinder=%d vndbinder=%d\r\n",
+                  path_exists("/dev/binderfs/binder"),
+                  path_exists("/dev/binderfs/hwbinder"),
+                  path_exists("/dev/binderfs/vndbinder"));
+
+    for (int s = 0; svcs[s] && n < (int)bufsz - 96; s++) {
+        n += snprintf(buf + n, bufsz - (size_t)n, "%s: running=%d",
+                      svcs[s], proc_running(svcs[s]));
+        int found = 0;
+        for (int p = 0; prefixes[p] && n < (int)bufsz - 96; p++) {
+            char path[192];
+            snprintf(path, sizeof(path), "%s%s", prefixes[p], svcs[s]);
+            if (path_exists(path)) {
+                n += snprintf(buf + n, bufsz - (size_t)n, " at=%s", path);
+                found = 1;
+                break;
+            }
+        }
+        if (!found)
+            n += snprintf(buf + n, bufsz - (size_t)n, " (not found anywhere)");
+        n += snprintf(buf + n, bufsz - (size_t)n, "\r\n");
+    }
+    n += snprintf(buf + n, bufsz - (size_t)n, "%s", get_binder_exit_report());
+    return n;
+}
+
+int radio_format_icnss(char *buf, size_t bufsz)
+{
+    int n = 0;
+    static const char *dbg[] = {
+        "/sys/kernel/debug/icnss/state",
+        "/sys/kernel/debug/icnss/stats",
+        NULL
+    };
+
+    n += snprintf(buf + n, bufsz - (size_t)n, "icnss-state\r\n");
+    n += snprintf(buf + n, bufsz - (size_t)n, "build=%s\r\n", CNSS_BUILD_TAG);
+    n += snprintf(buf + n, bufsz - (size_t)n, "qrtr=%d pdmap=%d daemon=%d\r\n",
+                  proc_running("qrtr-ns"), proc_running("pd-mapper"),
+                  proc_running("cnss-daemon"));
+    n += snprintf(buf + n, bufsz - (size_t)n, "hwserv=%d servicemgr=%d\r\n",
+                  proc_running("hwservicemanager"), proc_running("servicemanager"));
+    {
+        char mst[32] = "?";
+        if (read_subsys_state("subsys0", mst, sizeof(mst)) == 0)
+            n += snprintf(buf + n, bufsz - (size_t)n, "modem=%s wlfw=%d\r\n",
+                          mst, qrtr_has_wlfw());
+        else
+            n += snprintf(buf + n, bufsz - (size_t)n, "modem=? wlfw=%d\r\n",
+                          qrtr_has_wlfw());
+    }
+    /* Show ICNSS_FW_READY from debugfs if available */
+    {
+        int fw_rdy = icnss_fw_ready_check();
+        char st_hex[32] = "n/a";
+        int sfd = open("/sys/kernel/debug/icnss/state", O_RDONLY);
+        if (sfd >= 0) {
+            ssize_t r = read(sfd, st_hex, sizeof(st_hex) - 1);
+            close(sfd);
+            if (r > 0) { st_hex[r] = '\0'; char *nl = strchr(st_hex, '\n'); if (nl) *nl = '\0'; }
+        }
+        n += snprintf(buf + n, bufsz - (size_t)n,
+                      "fw_ready=%d icnss/state=%s\r\n", fw_rdy, st_hex);
+    }
+    {
+        /* /dev/wlan existence and shutdown_wlan state */
+        char sdval[8] = "?";
+        int sfd = open("/sys/kernel/shutdown_wlan/shutdown", O_RDONLY);
+        if (sfd >= 0) {
+            ssize_t r = read(sfd, sdval, sizeof(sdval) - 1);
+            close(sfd);
+            if (r > 0) {
+                sdval[r] = '\0';
+                char *nl = strchr(sdval, '\n');
+                if (nl) *nl = '\0';
+            }
+        }
+        n += snprintf(buf + n, bufsz - (size_t)n,
+                      "devwlan=%s shutdown_wlan=%s\r\n",
+                      path_exists("/dev/wlan") ? "yes" : "no", sdval);
+    }
+    {
+        int fd = open("/sys/module/wlan/parameters/fwpath", O_RDONLY);
+        if (fd >= 0) {
+            char p[32];
+            ssize_t r = read(fd, p, sizeof(p) - 1);
+            close(fd);
+            if (r > 0) {
+                p[r] = '\0';
+                char *nl = strchr(p, '\n');
+                if (nl)
+                    *nl = '\0';
+                n += snprintf(buf + n, bufsz - (size_t)n, "wlan fwpath=%s\r\n", p);
+            }
+        }
+    }
+    if (path_exists("/proc/net/qrtr")) {
+        int fd = open("/proc/net/qrtr", O_RDONLY);
+        char chunk[512];
+        if (fd >= 0) {
+            n += snprintf(buf + n, bufsz - (size_t)n, "qrtr-nodes:\r\n");
+            while (n < (int)bufsz - 64) {
+                ssize_t r = read(fd, chunk, sizeof(chunk) - 1);
+                if (r <= 0)
+                    break;
+                chunk[r] = '\0';
+                n += snprintf(buf + n, bufsz - (size_t)n, "%s", chunk);
+            }
+            close(fd);
+        }
+    } else {
+        n += snprintf(buf + n, bufsz - (size_t)n, "qrtr-nodes: none\r\n");
+    }
+    for (int i = 0; dbg[i] && n < (int)bufsz - 128; i++) {
+        int fd = open(dbg[i], O_RDONLY);
+        char chunk[256];
+        if (fd < 0)
+            continue;
+        n += snprintf(buf + n, bufsz - (size_t)n, "%s:\r\n", dbg[i]);
+        while (n < (int)bufsz - 64) {
+            ssize_t r = read(fd, chunk, sizeof(chunk) - 1);
+            if (r <= 0)
+                break;
+            chunk[r] = '\0';
+            n += snprintf(buf + n, bufsz - (size_t)n, "%s", chunk);
+        }
+        n += snprintf(buf + n, bufsz - (size_t)n, "\r\n");
+        close(fd);
+    }
+    return n;
+}
+
+int radio_format_diag(char *buf, size_t bufsz)
+{
+    int n = 0;
+
+    sync_mount_flags();
+    n += snprintf(buf + n, bufsz - (size_t)n,
+                  "radio-diag\r\n"
+                  "vendor=%d system=%d persist=%d modem=%d bt_fw=%d wlan_fw=%d\r\n"
+                  "cnss qrtr=%d pdmap=%d daemon=%d vndksupport=%d\r\n"
+                  "wlan0=%s hci0=%s\r\n",
+                  vendor_mounted, system_mounted, persist_mounted, modem_mounted, bt_fw_mounted,
+                  has_wlan_firmware(),
+                  proc_running("qrtr-ns"), proc_running("pd-mapper"),
+                  proc_running("cnss-daemon"), path_exists("/lib64/libvndksupport.so"),
+                  path_exists("/sys/class/net/wlan0") ? "yes" : "no",
+                  path_exists("/sys/class/bluetooth/hci0") ? "yes" : "no");
+    if (n < (int)bufsz) {
+        int fd = open("/proc/mounts", O_RDONLY);
+        if (fd >= 0) {
+            char m[1024];
+            ssize_t r = read(fd, m, sizeof(m) - 1);
+            close(fd);
+            if (r > 0) {
+                m[r] = '\0';
+                n += snprintf(buf + n, bufsz - (size_t)n, "mounts:\r\n");
+                for (char *line = m; line && *line && n < (int)bufsz - 48; ) {
+                    char *nl = strchr(line, '\n');
+                    if (nl)
+                        *nl++ = '\0';
+                    if (strstr(line, "vendor") || strstr(line, "persist") ||
+                        strstr(line, "firmware") || strstr(line, "modem"))
+                        n += snprintf(buf + n, bufsz - (size_t)n, "  %s\r\n", line);
+                    line = nl;
+                }
+            }
+        }
+    }
+    if (n < (int)bufsz) {
+        int fd = open("/sys/module/wlan/parameters/con_mode", O_RDONLY);
+        if (fd >= 0) {
+            char p[32];
+            ssize_t r = read(fd, p, sizeof(p) - 1);
+            close(fd);
+            if (r > 0) {
+                p[r] = '\0';
+                n += snprintf(buf + n, bufsz - (size_t)n, "wlan con_mode=%s\r\n", p);
+            }
+        }
+    }
+    if (n < (int)bufsz) {
+        static const char *dbg[] = {
+            "/sys/kernel/debug/icnss/stats",
+            "/sys/kernel/debug/icnss/state",
+            NULL
+        };
+        for (int i = 0; dbg[i] && n < (int)bufsz - 128; i++) {
+            int fd = open(dbg[i], O_RDONLY);
+            char chunk[256];
+            if (fd < 0)
+                continue;
+            n += snprintf(buf + n, bufsz - (size_t)n, "%s:\r\n", dbg[i]);
+            while (n < (int)bufsz - 64) {
+                ssize_t r = read(fd, chunk, sizeof(chunk) - 1);
+                if (r <= 0)
+                    break;
+                chunk[r] = '\0';
+                n += snprintf(buf + n, bufsz - (size_t)n, "%s", chunk);
+            }
+            n += snprintf(buf + n, bufsz - (size_t)n, "\r\n");
+            close(fd);
+        }
+    }
+    if (n < (int)bufsz)
+        n += radio_format_fw_list(buf + n, bufsz - (size_t)n);
+    return n;
 }

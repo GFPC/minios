@@ -8,9 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
-/* GitHub-dark inspired palette */
 #define COL_BG      0xFF0D1117
 #define COL_CARD    0xFF161B22
 #define COL_BORDER  0xFF30363D
@@ -24,10 +24,14 @@
 #define COL_MUTED   0xFF8B949E
 #define COL_TAB_ON  0xFF1F6FEB
 #define COL_TAB_OFF 0xFF21262D
-#define COL_BEZEL   0xFF000000
-#define COL_GLOW    0xFF388BFD33
-#define CUR_R       18
+#define COL_LOG_BG  0xFF010409
+#define COL_LOG_HDR 0xFF161B22
+#define CUR_R       14
 #define CUR_PAD     (CUR_R + 4)
+#define LOG_LINES   6
+#define LOG_COLS    56
+#define PAD         16
+#define METRICS_MS  3000
 
 enum { TAB_DASH = 0, TAB_POWER, TAB_SYS, TAB_RADIO, TAB_COUNT };
 enum { BTN_MAX = 8 };
@@ -55,52 +59,130 @@ static TouchCal touch_cal;
 static int touch_x, touch_y, touch_down;
 static int cur_x = -1, cur_y = -1;
 static int cur_vis;
-static int head_h, tab_h, content_y;
-static char status_line[96] = "MiniOS ready";
+static int head_h, tab_h, content_y, content_h, log_h, log_y, bottom_safe;
+static char status_line[96] = "MINIOS READY";
 static char status_prev[96] = "";
 static int frame;
 static int btn_dirty[BTN_MAX];
 static int tab_dirty[TAB_COUNT];
 static int content_dirty = 1;
+static int log_dirty = 1;
 static UiMetrics metrics;
 static unsigned long prev_idle, prev_total;
+static int cpu_warmed;
 static unsigned long last_metrics_ms;
-static int safe_l, safe_t, safe_r, safe_b, corner_r;
+static char log_ring[LOG_LINES][LOG_COLS];
+static int log_head;
+static int log_kmsg_fd = -1;
+static unsigned long last_kmsg_poll_ms;
 static char wifi_line[56] = "WIFI OFF";
 static char bt_line[56] = "BT OFF";
-
-static void layout_safe(void)
-{
-    corner_r = (int)screen.w / 26;
-    if (corner_r < 34)
-        corner_r = 34;
-    if (corner_r > 46)
-        corner_r = 46;
-    safe_l = safe_r = (int)screen.w / 27;
-    if (safe_l < 36)
-        safe_l = 36;
-    safe_t = (int)screen.h / 27;
-    if (safe_t < 80)
-        safe_t = 80;
-    safe_b = (int)screen.h / 40;
-    if (safe_b < 50)
-        safe_b = 50;
-}
+static UiMetrics metrics_prev;
+static int dash_layout_done;
+static int tile_cpu[4], tile_ram[4], tile_up[4], tile_adb[4], tile_rf[4];
 
 static int pad_x(void)
 {
-    return safe_l + 20;
+    return PAD;
 }
 
 static int content_w(void)
 {
-    return (int)screen.w - safe_l - safe_r - 40;
+    return (int)screen.w - PAD * 2;
+}
+
+static unsigned long monotonic_ms(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return (unsigned long)(frame * 33);
+    return (unsigned long)ts.tv_sec * 1000UL + (unsigned long)ts.tv_nsec / 1000000UL;
+}
+
+static void layout_metrics(void)
+{
+    bottom_safe = (int)screen.h / 14;
+    if (bottom_safe < 48)
+        bottom_safe = 48;
+    head_h = 68;
+    tab_h = 40;
+    log_h = 24 + LOG_LINES * 18;
+    log_y = head_h + tab_h + 6;
+    content_y = log_y + log_h + 10;
+    content_h = (int)screen.h - content_y - bottom_safe;
+    if (content_h < 100)
+        content_h = 100;
+}
+
+static void log_push(const char *msg)
+{
+    char line[LOG_COLS];
+    int i, j;
+
+    if (!msg || !msg[0])
+        return;
+    for (i = 0; msg[i] == ' '; i++)
+        ;
+    if (msg[i] == '<') {
+        while (msg[i] && msg[i] != '>')
+            i++;
+        if (msg[i] == '>')
+            i++;
+        while (msg[i] == ' ')
+            i++;
+    }
+    for (j = 0; j < LOG_COLS - 1 && msg[i]; i++) {
+        char c = msg[i];
+        if (c == '\n' || c == '\r')
+            break;
+        if (c >= 'a' && c <= 'z')
+            c = (char)(c - 'a' + 'A');
+        line[j++] = c;
+    }
+    line[j] = '\0';
+    if (!line[0])
+        return;
+
+    log_head = (log_head + 1) % LOG_LINES;
+    if (strcmp(log_ring[log_head], line) != 0) {
+        snprintf(log_ring[log_head], LOG_COLS, "%s", line);
+        log_dirty = 1;
+    }
+}
+
+static void log_poll_kmsg(void)
+{
+    char buf[512];
+    ssize_t n;
+    unsigned long now = monotonic_ms();
+
+    if (now - last_kmsg_poll_ms < 400UL)
+        return;
+    last_kmsg_poll_ms = now;
+
+    if (log_kmsg_fd < 0) {
+        log_kmsg_fd = open("/dev/kmsg", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (log_kmsg_fd < 0)
+            return;
+    }
+    while ((n = read(log_kmsg_fd, buf, sizeof(buf) - 1)) > 0) {
+        buf[n] = '\0';
+        char *p = buf, *nl;
+        while (p && *p) {
+            nl = strchr(p, '\n');
+            if (nl)
+                *nl = '\0';
+            log_push(p);
+            p = nl ? nl + 1 : NULL;
+        }
+    }
 }
 
 static void read_radio_status(void)
 {
     char buf[128];
     int fd = open("/tmp/radio.status", O_RDONLY);
+
     wifi_line[0] = bt_line[0] = '\0';
     if (fd < 0)
         return;
@@ -120,13 +202,7 @@ static void read_radio_status(void)
     }
 }
 
-static void draw_bezel_overlay(void)
-{
-    minui_draw_corner_bezels(&screen, safe_l, safe_t, safe_r, safe_b,
-                             corner_r, COL_BEZEL);
-}
-
-static void kmsg(const char *s)
+static void kmsg_ui(const char *s)
 {
     int fd = open("/dev/kmsg", O_WRONLY);
     if (fd >= 0) {
@@ -184,7 +260,9 @@ static int sysfs_dir_exists(const char *path)
 static unsigned long read_uptime_sec(void)
 {
     char buf[64];
+    double up;
     int fd = open("/proc/uptime", O_RDONLY);
+
     if (fd < 0)
         return 0;
     ssize_t n = read(fd, buf, sizeof(buf) - 1);
@@ -192,27 +270,42 @@ static unsigned long read_uptime_sec(void)
     if (n <= 0)
         return 0;
     buf[n] = '\0';
-    return (unsigned long)atof(buf);
+    if (sscanf(buf, "%lf", &up) != 1)
+        return 0;
+    return (unsigned long)up;
 }
 
-static void read_meminfo(unsigned long *total_kb, unsigned long *avail_kb)
+static void read_meminfo(unsigned long *total_kb, unsigned long *avail_kb,
+                         unsigned long *free_kb)
 {
-    char line[128];
+    char buf[2048];
     int fd = open("/proc/meminfo", O_RDONLY);
-    *total_kb = 0;
-    *avail_kb = 0;
+
+    *total_kb = *avail_kb = *free_kb = 0;
     if (fd < 0)
         return;
-    while (read(fd, line, sizeof(line) - 1) > 0) {
-        unsigned long v = 0;
-        if (!strncmp(line, "MemTotal:", 9))
-            sscanf(line + 9, "%lu", &v), *total_kb = v;
-        else if (!strncmp(line, "MemAvailable:", 13))
-            sscanf(line + 13, "%lu", &v), *avail_kb = v;
-        if (*total_kb && *avail_kb)
-            break;
-    }
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
     close(fd);
+    if (n <= 0)
+        return;
+    buf[n] = '\0';
+
+    char *p = buf;
+    while (p && *p) {
+        char *nl = strchr(p, '\n');
+        if (nl)
+            *nl = '\0';
+        unsigned long v = 0;
+        if (!strncmp(p, "MemTotal:", 9))
+            sscanf(p + 9, "%lu", &v), *total_kb = v;
+        else if (!strncmp(p, "MemAvailable:", 13))
+            sscanf(p + 13, "%lu", &v), *avail_kb = v;
+        else if (!strncmp(p, "MemFree:", 8))
+            sscanf(p + 8, "%lu", &v), *free_kb = v;
+        p = nl ? nl + 1 : NULL;
+    }
+    if (*avail_kb == 0 && *free_kb > 0)
+        *avail_kb = *free_kb;
 }
 
 static int read_cpu_usage_pct(void)
@@ -220,7 +313,7 @@ static int read_cpu_usage_pct(void)
     char buf[256];
     int fd = open("/proc/stat", O_RDONLY);
     unsigned long user, nice, sys, idle, iow, irq, sirq, steal;
-    unsigned long total, idle_all;
+    unsigned long total, idle_all, d_total, d_idle;
 
     if (fd < 0)
         return metrics.cpu_pct;
@@ -238,15 +331,19 @@ static int read_cpu_usage_pct(void)
     if (prev_total == 0) {
         prev_idle = idle_all;
         prev_total = total;
+        cpu_warmed = 0;
         return 0;
     }
-    unsigned long d_total = total - prev_total;
-    unsigned long d_idle = idle_all - prev_idle;
+
+    d_total = total - prev_total;
+    d_idle = idle_all - prev_idle;
     prev_idle = idle_all;
     prev_total = total;
     if (d_total == 0)
         return metrics.cpu_pct;
-    int pct = (int)(100 - (100 * d_idle / d_total));
+
+    cpu_warmed = 1;
+    int pct = (int)((100UL * (d_total - d_idle) + d_total / 2) / d_total);
     if (pct < 0)
         pct = 0;
     if (pct > 100)
@@ -256,56 +353,51 @@ static int read_cpu_usage_pct(void)
 
 static void metrics_update(void)
 {
-    unsigned long total_kb = 0, avail_kb = 0;
+    unsigned long total_kb = 0, avail_kb = 0, free_kb = 0;
 
     metrics.cpu_pct = read_cpu_usage_pct();
-    read_meminfo(&total_kb, &avail_kb);
+    read_meminfo(&total_kb, &avail_kb, &free_kb);
     if (total_kb > 0) {
-        metrics.ram_total_mb = total_kb / 1024;
-        metrics.ram_used_mb = (total_kb - avail_kb) / 1024;
-        metrics.ram_pct = (int)((metrics.ram_used_mb * 100) / metrics.ram_total_mb);
+        unsigned long used_kb = total_kb - avail_kb;
+        metrics.ram_total_mb = (total_kb + 512) / 1024;
+        metrics.ram_used_mb = (used_kb + 512) / 1024;
+        metrics.ram_pct = (int)((used_kb * 100 + total_kb / 2) / total_kb);
     }
     metrics.uptime_sec = read_uptime_sec();
-    metrics.adb_on = access("/tmp/adb.active", F_OK) == 0 ||
-                     access("/tmp/adbd.pid", F_OK) == 0 ||
-                     access("/sbin/adbd", X_OK) == 0;
+    metrics.adb_on = access("/tmp/adbd.pid", F_OK) == 0 ||
+                     access("/tmp/adb.active", F_OK) == 0;
     metrics.touch_ok = touch_ok;
     read_radio_status();
     metrics.wifi_seen = sysfs_dir_exists("/sys/class/net/wlan0") ||
-                        (wifi_line[0] && strstr(wifi_line, "wlan"));
+                        (wifi_line[0] && strstr(wifi_line, "WLAN"));
     metrics.bt_seen = sysfs_dir_exists("/sys/class/bluetooth/hci0") ||
-                      (bt_line[0] && strstr(bt_line, "hci"));
-    content_dirty = 1;
+                      (bt_line[0] && strstr(bt_line, "HCI"));
 }
 
 static void layout_tabs(void)
 {
-    int pad = 10;
     int x0 = pad_x();
-    int tw = (content_w() - pad * (TAB_COUNT - 1)) / TAB_COUNT;
-    if (tw < 72)
-        tw = 72;
-    tab_h = 50;
-    head_h = safe_t + 92;
+    int gap = 8;
+    int tw = (content_w() - gap * (TAB_COUNT - 1)) / TAB_COUNT;
+    if (tw < 64)
+        tw = 64;
     const char *labels[TAB_COUNT] = { "DASH", "PWR", "SYS", "RAD" };
     for (int i = 0; i < TAB_COUNT; i++) {
-        int x = x0 + i * (tw + pad);
         tabs[i] = (MinuiBtn){
-            x, head_h, tw, tab_h,
+            x0 + i * (tw + gap), head_h, tw, tab_h,
             i == active_tab ? COL_TAB_ON : COL_TAB_OFF,
             COL_BORDER, labels[i], i, 0
         };
     }
-    content_y = head_h + tab_h + 14;
 }
 
 static void layout_power_buttons(void)
 {
     int x0 = pad_x();
-    int gap = 14;
+    int gap = 12;
     int bw = (content_w() - gap) / 2;
-    int bh = 80;
-    int y0 = content_y + 16;
+    int bh = 68;
+    int y0 = content_y + 12;
     n_buttons = 4;
     buttons[0] = (MinuiBtn){ x0, y0, bw, bh, COL_RED, COL_BORDER, "OFF", 0, 0 };
     buttons[1] = (MinuiBtn){ x0 + bw + gap, y0, bw, bh, COL_ORANGE, COL_BORDER, "REBOOT", 1, 0 };
@@ -318,9 +410,9 @@ static void layout_sys_buttons(void)
     int x0 = pad_x();
     int cw = content_w();
     n_buttons = 2;
-    buttons[0] = (MinuiBtn){ x0, content_y + 250, cw, 68,
+    buttons[0] = (MinuiBtn){ x0, content_y + content_h - 140, cw, 56,
                               COL_GREEN, COL_BORDER, "COM MODE", 10, 0 };
-    buttons[1] = (MinuiBtn){ x0, content_y + 330, cw, 68,
+    buttons[1] = (MinuiBtn){ x0, content_y + content_h - 72, cw, 56,
                               COL_ACCENT, COL_BORDER, "VIB TEST", 11, 0 };
 }
 
@@ -328,9 +420,9 @@ static void layout_radio_buttons(void)
 {
     int x0 = pad_x();
     n_buttons = 2;
-    buttons[0] = (MinuiBtn){ x0, content_y + 200, content_w(), 68,
+    buttons[0] = (MinuiBtn){ x0, content_y + content_h - 140, content_w(), 56,
                               COL_TAB_ON, COL_BORDER, "START RADIO", 20, 0 };
-    buttons[1] = (MinuiBtn){ x0, content_y + 280, content_w(), 68,
+    buttons[1] = (MinuiBtn){ x0, content_y + content_h - 72, content_w(), 56,
                               COL_TAB_OFF, COL_BORDER, "PROBE", 21, 0 };
 }
 
@@ -354,115 +446,213 @@ static void layout_content_buttons(void)
 
 static void fmt_uptime(char *out, size_t outsz, unsigned long sec)
 {
-    unsigned long h = sec / 3600;
+    unsigned long d = sec / 86400;
+    unsigned long h = (sec % 86400) / 3600;
     unsigned long m = (sec % 3600) / 60;
     unsigned long s = sec % 60;
-    snprintf(out, outsz, "%lu:%02lu:%02lu", h, m, s);
+    if (d > 0)
+        snprintf(out, outsz, "%lud %02lu:%02lu:%02lu", d, h, m, s);
+    else
+        snprintf(out, outsz, "%02lu:%02lu:%02lu", h, m, s);
 }
 
 static void draw_header(void)
 {
-    int y0 = safe_t;
-    minui_fill_rect(&screen, safe_l, y0, (int)screen.w - safe_l - safe_r, 92,
-                    COL_HEAD);
-    minui_fill_rect(&screen, safe_l, y0, (int)screen.w - safe_l - safe_r, 4,
-                    COL_ACCENT);
-    minui_text(&screen, pad_x(), y0 + 14, "MINIOS", COL_WHITE, 3);
-    minui_text(&screen, pad_x(), y0 + 52, "CONTROL CENTER", COL_MUTED, 2);
-    minui_text(&screen, pad_x(), y0 + 72, status_line, COL_ACCENT, 2);
+    minui_fill_rect(&screen, 0, 0, (int)screen.w, head_h, COL_HEAD);
+    minui_fill_rect(&screen, 0, head_h - 3, (int)screen.w, 3, COL_ACCENT);
+    minui_text(&screen, pad_x(), 12, "MINIOS", COL_WHITE, 3);
+    minui_text(&screen, pad_x() + 120, 18, "CONTROL", COL_MUTED, 2);
+    minui_text(&screen, pad_x(), 46, status_line, COL_ACCENT, 2);
     strncpy(status_prev, status_line, sizeof(status_prev) - 1);
     status_prev[sizeof(status_prev) - 1] = '\0';
 }
 
 static void draw_tabs(void)
 {
+    minui_fill_rect(&screen, 0, head_h, (int)screen.w, tab_h + 8, COL_BG);
     for (int i = 0; i < TAB_COUNT; i++) {
         tabs[i].color = (i == active_tab) ? COL_TAB_ON : COL_TAB_OFF;
         minui_btn_draw(&screen, &tabs[i]);
     }
 }
 
+static int metrics_changed(void)
+{
+    return memcmp(&metrics, &metrics_prev, sizeof(metrics)) != 0;
+}
+
+static void metrics_snapshot(void)
+{
+    metrics_prev = metrics;
+}
+
+static void erase_tile(int x, int y, int w, int h)
+{
+    minui_fill_rect(&screen, x, y, w, h, COL_BG);
+}
+
+static void draw_stat_tile(int x, int y, int w, int h, const char *title,
+                           const char *value, int pct, uint32_t bar_col)
+{
+    minui_card(&screen, x, y, w, h, COL_CARD, COL_BORDER);
+    minui_text(&screen, x + 12, y + 8, title, COL_MUTED, 2);
+    minui_text(&screen, x + 12, y + 28, value, COL_WHITE, 2);
+    if (pct >= 0)
+        minui_bar_round(&screen, x + 12, y + h - 20, w - 24, 8, pct, 4,
+                        bar_col, 0xFF21262D);
+}
+
+static void dash_layout_tiles(void)
+{
+    int x0 = pad_x();
+    int cw = content_w();
+    int gap = 8;
+    int half = (cw - gap) / 2;
+    int tile_h = 64;
+    int y = content_y + 2;
+
+    tile_cpu[0] = x0; tile_cpu[1] = y; tile_cpu[2] = half; tile_cpu[3] = tile_h;
+    tile_ram[0] = x0 + half + gap; tile_ram[1] = y; tile_ram[2] = half; tile_ram[3] = tile_h;
+    y += tile_h + gap;
+    tile_up[0] = x0; tile_up[1] = y; tile_up[2] = half; tile_up[3] = tile_h;
+    tile_adb[0] = x0 + half + gap; tile_adb[1] = y; tile_adb[2] = half; tile_adb[3] = tile_h;
+    y += tile_h + gap;
+    tile_rf[0] = x0; tile_rf[1] = y; tile_rf[2] = cw; tile_rf[3] = 48;
+    dash_layout_done = 1;
+}
+
 static void draw_dash_content(void)
 {
     int x0 = pad_x();
     int cw = content_w();
-    int y = content_y;
-    char line[64];
+    char val[48];
 
-    minui_card(&screen, x0, y, cw, 108, COL_CARD, COL_BORDER);
-    snprintf(line, sizeof(line), "%d%%", metrics.cpu_pct);
-    minui_text(&screen, x0 + 16, y + 14, "CPU", COL_MUTED, 2);
-    minui_text(&screen, x0 + cw - 80, y + 14, line, COL_WHITE, 2);
-    minui_bar_round(&screen, x0 + 16, y + 52, cw - 32, 18, metrics.cpu_pct, 9,
-                    COL_ACCENT, 0xFF0D1117);
+    if (!dash_layout_done)
+        dash_layout_tiles();
 
-    y += 120;
-    minui_card(&screen, x0, y, cw, 108, COL_CARD, COL_BORDER);
-    snprintf(line, sizeof(line), "%lu/%lu MB",
+    snprintf(val, sizeof(val), cpu_warmed ? "%d%%" : "--%%", metrics.cpu_pct);
+    draw_stat_tile(tile_cpu[0], tile_cpu[1], tile_cpu[2], tile_cpu[3],
+                   "CPU", val, metrics.cpu_pct, COL_ACCENT);
+
+    snprintf(val, sizeof(val), "%lu/%lu MB",
              metrics.ram_used_mb, metrics.ram_total_mb);
-    minui_text(&screen, x0 + 16, y + 14, "RAM", COL_MUTED, 2);
-    minui_text(&screen, x0 + 16, y + 44, line, COL_WHITE, 2);
-    minui_bar_round(&screen, x0 + 16, y + 72, cw - 32, 18, metrics.ram_pct, 9,
-                    COL_GREEN, 0xFF0D1117);
+    draw_stat_tile(tile_ram[0], tile_ram[1], tile_ram[2], tile_ram[3],
+                   "RAM", val, metrics.ram_pct, COL_GREEN);
 
-    y += 120;
-    minui_card(&screen, x0, y, cw, 84, COL_CARD, COL_BORDER);
-    char up[32];
-    fmt_uptime(up, sizeof(up), metrics.uptime_sec);
-    minui_text(&screen, x0 + 16, y + 14, "UPTIME", COL_MUTED, 2);
-    minui_text(&screen, x0 + 16, y + 44, up, COL_WHITE, 2);
+    fmt_uptime(val, sizeof(val), metrics.uptime_sec);
+    draw_stat_tile(tile_up[0], tile_up[1], tile_up[2], tile_up[3],
+                   "UPTIME", val, -1, COL_ACCENT);
 
-    y += 96;
-    minui_card(&screen, x0, y, cw, 84, COL_CARD, COL_BORDER);
-    minui_text(&screen, x0 + 16, y + 14, "USB ADB", COL_MUTED, 2);
-    minui_text(&screen, x0 + 16, y + 44,
-               metrics.adb_on ? "4EE7 ONLINE" : "OFFLINE", COL_WHITE, 2);
+    snprintf(val, sizeof(val), metrics.adb_on ? "TCP ON" : "ADB OFF");
+    draw_stat_tile(tile_adb[0], tile_adb[1], tile_adb[2], tile_adb[3],
+                   "ADB", val, -1, metrics.adb_on ? COL_GREEN : COL_MUTED);
+
+    erase_tile(tile_rf[0], tile_rf[1], tile_rf[2], tile_rf[3]);
+    minui_card(&screen, tile_rf[0], tile_rf[1], tile_rf[2], tile_rf[3],
+               COL_CARD, COL_BORDER);
+    minui_fill_roundrect(&screen, x0 + 14, tile_rf[1] + 16, 8, 8, 4,
+                         metrics.wifi_seen ? COL_GREEN : COL_RED);
+    minui_text(&screen, x0 + 28, tile_rf[1] + 10,
+               wifi_line[0] ? wifi_line : "WIFI IDLE", COL_WHITE, 2);
+    minui_fill_roundrect(&screen, x0 + cw / 2 + 8, tile_rf[1] + 16, 8, 8, 4,
+                         metrics.bt_seen ? COL_GREEN : COL_RED);
+    minui_text(&screen, x0 + cw / 2 + 22, tile_rf[1] + 10,
+               bt_line[0] ? bt_line : "BT IDLE", COL_WHITE, 2);
+}
+
+static void draw_dash_delta(void)
+{
+    char val[48];
+
+    if (!dash_layout_done)
+        dash_layout_tiles();
+
+    if (metrics.cpu_pct != metrics_prev.cpu_pct ||
+        metrics.ram_pct != metrics_prev.ram_pct) {
+        snprintf(val, sizeof(val), cpu_warmed ? "%d%%" : "--%%", metrics.cpu_pct);
+        erase_tile(tile_cpu[0], tile_cpu[1], tile_cpu[2], tile_cpu[3]);
+        draw_stat_tile(tile_cpu[0], tile_cpu[1], tile_cpu[2], tile_cpu[3],
+                       "CPU", val, metrics.cpu_pct, COL_ACCENT);
+    }
+    if (metrics.ram_used_mb != metrics_prev.ram_used_mb ||
+        metrics.ram_total_mb != metrics_prev.ram_total_mb ||
+        metrics.ram_pct != metrics_prev.ram_pct) {
+        snprintf(val, sizeof(val), "%lu/%lu MB",
+                 metrics.ram_used_mb, metrics.ram_total_mb);
+        erase_tile(tile_ram[0], tile_ram[1], tile_ram[2], tile_ram[3]);
+        draw_stat_tile(tile_ram[0], tile_ram[1], tile_ram[2], tile_ram[3],
+                       "RAM", val, metrics.ram_pct, COL_GREEN);
+    }
+    if (metrics.uptime_sec != metrics_prev.uptime_sec) {
+        fmt_uptime(val, sizeof(val), metrics.uptime_sec);
+        erase_tile(tile_up[0], tile_up[1], tile_up[2], tile_up[3]);
+        draw_stat_tile(tile_up[0], tile_up[1], tile_up[2], tile_up[3],
+                       "UPTIME", val, -1, COL_ACCENT);
+    }
+    if (metrics.adb_on != metrics_prev.adb_on) {
+        snprintf(val, sizeof(val), metrics.adb_on ? "TCP ON" : "ADB OFF");
+        erase_tile(tile_adb[0], tile_adb[1], tile_adb[2], tile_adb[3]);
+        draw_stat_tile(tile_adb[0], tile_adb[1], tile_adb[2], tile_adb[3],
+                       "ADB", val, -1, metrics.adb_on ? COL_GREEN : COL_MUTED);
+    }
+    if (metrics.wifi_seen != metrics_prev.wifi_seen ||
+        metrics.bt_seen != metrics_prev.bt_seen) {
+        erase_tile(tile_rf[0], tile_rf[1], tile_rf[2], tile_rf[3]);
+        int x0 = pad_x(), cw = content_w();
+        minui_card(&screen, tile_rf[0], tile_rf[1], tile_rf[2], tile_rf[3],
+                   COL_CARD, COL_BORDER);
+        minui_fill_roundrect(&screen, x0 + 14, tile_rf[1] + 16, 8, 8, 4,
+                             metrics.wifi_seen ? COL_GREEN : COL_RED);
+        minui_text(&screen, x0 + 28, tile_rf[1] + 10,
+                   wifi_line[0] ? wifi_line : "WIFI IDLE", COL_WHITE, 2);
+        minui_fill_roundrect(&screen, x0 + cw / 2 + 8, tile_rf[1] + 16, 8, 8, 4,
+                             metrics.bt_seen ? COL_GREEN : COL_RED);
+        minui_text(&screen, x0 + cw / 2 + 22, tile_rf[1] + 10,
+                   bt_line[0] ? bt_line : "BT IDLE", COL_WHITE, 2);
+    }
 }
 
 static void draw_sys_content(void)
 {
     int x0 = pad_x();
     int cw = content_w();
-    int y = content_y;
+    int y = content_y + 8;
     char line[80];
 
-    minui_card(&screen, x0, y, cw, 220, COL_CARD, COL_BORDER);
-    minui_text(&screen, x0 + 16, y + 14, "SYSTEM", COL_MUTED, 2);
+    minui_card(&screen, x0, y, cw, 110, COL_CARD, COL_BORDER);
+    minui_text(&screen, x0 + 12, y + 10, "SYSTEM INFO", COL_MUTED, 2);
     snprintf(line, sizeof(line), "TOUCH %s", metrics.touch_ok ? "OK" : "NO");
-    minui_text(&screen, x0 + 16, y + 48, line, COL_WHITE, 2);
-    snprintf(line, sizeof(line), "CPU %d%% RAM %d%%",
+    minui_text(&screen, x0 + 12, y + 36, line, COL_WHITE, 2);
+    fmt_uptime(line, sizeof(line), metrics.uptime_sec);
+    minui_text(&screen, x0 + 12, y + 60, line, COL_WHITE, 2);
+    snprintf(line, sizeof(line), "CPU %d%%  RAM %d%%",
              metrics.cpu_pct, metrics.ram_pct);
-    minui_text(&screen, x0 + 16, y + 84, line, COL_WHITE, 2);
-    minui_text(&screen, x0 + 16, y + 120, "ADB 4EE7 ONLINE", COL_WHITE, 2);
-    minui_text(&screen, x0 + 16, y + 156, "COM VIA BUTTON", COL_MUTED, 2);
+    minui_text(&screen, x0 + 12, y + 84, line, COL_WHITE, 2);
+    snprintf(line, sizeof(line), "ADB %s", metrics.adb_on ? "ACTIVE" : "IDLE");
+    minui_text(&screen, x0 + 12, y + 108, line, COL_WHITE, 2);
 }
 
 static void draw_radio_content(void)
 {
     int x0 = pad_x();
     int cw = content_w();
-    int y = content_y;
-    uint32_t wcol = metrics.wifi_seen ? COL_GREEN : COL_MUTED;
-    uint32_t bcol = metrics.bt_seen ? COL_GREEN : COL_MUTED;
+    int y = content_y + 8;
 
-    minui_card(&screen, x0, y, cw, 170, COL_CARD, COL_BORDER);
-    minui_text(&screen, x0 + 16, y + 14, "WIRELESS", COL_MUTED, 2);
-    minui_fill_roundrect(&screen, x0 + 16, y + 48, 10, 10, 5,
+    minui_card(&screen, x0, y, cw, 120, COL_CARD, COL_BORDER);
+    minui_text(&screen, x0 + 12, y + 10, "WIRELESS", COL_MUTED, 2);
+    minui_fill_roundrect(&screen, x0 + 14, y + 40, 8, 8, 4,
                          metrics.wifi_seen ? COL_GREEN : COL_RED);
-    minui_text(&screen, x0 + 34, y + 44, wifi_line[0] ? wifi_line : "WIFI OFF",
-               wcol, 2);
-    minui_fill_roundrect(&screen, x0 + 16, y + 84, 10, 10, 5,
+    minui_text(&screen, x0 + 28, y + 34,
+               wifi_line[0] ? wifi_line : "WIFI OFF", COL_WHITE, 2);
+    minui_fill_roundrect(&screen, x0 + 14, y + 72, 8, 8, 4,
                          metrics.bt_seen ? COL_GREEN : COL_RED);
-    minui_text(&screen, x0 + 34, y + 80, bt_line[0] ? bt_line : "BT OFF",
-               bcol, 2);
-    minui_text(&screen, x0 + 16, y + 120, "TAP START RADIO", COL_MUTED, 2);
+    minui_text(&screen, x0 + 28, y + 66,
+               bt_line[0] ? bt_line : "BT OFF", COL_WHITE, 2);
 }
 
 static void draw_content(void)
 {
-    int y0 = content_y - 8;
-    int h = (int)screen.h - y0;
-    minui_fill_rect(&screen, 0, y0, (int)screen.w, h, COL_BG);
+    minui_fill_rect(&screen, 0, content_y, (int)screen.w, content_h, COL_BG);
 
     switch (active_tab) {
     case TAB_DASH:
@@ -482,18 +672,64 @@ static void draw_content(void)
         minui_btn_draw(&screen, &buttons[i]);
 }
 
+static void draw_log_panel(void)
+{
+    int x0 = pad_x();
+    int cw = content_w();
+
+    minui_fill_rect(&screen, 0, log_y - 2, (int)screen.w, log_h + 4, COL_BG);
+    minui_fill_roundrect(&screen, x0, log_y, cw, log_h, 10, COL_LOG_BG);
+    minui_roundrect_outline(&screen, x0, log_y, cw, log_h, 10, COL_ACCENT);
+    minui_fill_rect(&screen, x0 + 1, log_y + 1, cw - 2, 20, COL_LOG_HDR);
+    minui_text(&screen, x0 + 10, log_y + 4, "KERNEL LOG", COL_ACCENT, 2);
+
+    int ly = log_y + 24;
+    for (int i = 0; i < LOG_LINES; i++) {
+        int idx = (log_head + 1 + i) % LOG_LINES;
+        const char *line = log_ring[idx];
+        if (!line[0])
+            continue;
+        minui_text(&screen, x0 + 8, ly, ">", COL_GREEN, 2);
+        minui_text(&screen, x0 + 20, ly, line, COL_WHITE, 2);
+        ly += 18;
+    }
+    log_dirty = 0;
+}
+
+static void draw_log_delta(void)
+{
+    int x0 = pad_x();
+    int cw = content_w();
+    int ly = log_y + 24;
+
+    minui_fill_rect(&screen, x0 + 1, log_y + 22, cw - 2, log_h - 24, COL_LOG_BG);
+    for (int i = 0; i < LOG_LINES; i++) {
+        int idx = (log_head + 1 + i) % LOG_LINES;
+        const char *line = log_ring[idx];
+        minui_fill_rect(&screen, x0 + 8, ly, cw - 16, 16, COL_LOG_BG);
+        if (line[0]) {
+            minui_text(&screen, x0 + 8, ly, ">", COL_GREEN, 2);
+            minui_text(&screen, x0 + 20, ly, line, COL_WHITE, 2);
+        }
+        ly += 18;
+    }
+    log_dirty = 0;
+}
+
 static void draw_static_scene(void)
 {
-    minui_fill(&screen, COL_BEZEL);
-    minui_fill_rect(&screen, safe_l, safe_t,
-                    (int)screen.w - safe_l - safe_r,
-                    (int)screen.h - safe_t - safe_b, COL_BG);
+    minui_fill(&screen, COL_BG);
     draw_header();
     draw_tabs();
+    draw_log_panel();
     layout_content_buttons();
+    dash_layout_done = 0;
     draw_content();
-    draw_bezel_overlay();
+    if (bottom_safe > 0)
+        minui_fill_rect(&screen, 0, (int)screen.h - bottom_safe,
+                        (int)screen.w, bottom_safe, COL_BG);
     content_dirty = 0;
+    metrics_snapshot();
 }
 
 static int rects_overlap(int ax, int ay, int aw, int ah,
@@ -506,34 +742,26 @@ static void restore_rect(int x, int y, int w, int h)
 {
     if (content_dirty)
         return;
-    minui_fill_rect(&screen, x, y, w, h, COL_BG);
 
-    if (rects_overlap(x, y, w, h, 0, 0, (int)screen.w, head_h)) {
-        draw_header();
+    if (rects_overlap(x, y, w, h, 0, log_y, (int)screen.w, log_h + 4)) {
+        draw_log_delta();
+        return;
     }
-    if (rects_overlap(x, y, w, h, 0, head_h, (int)screen.w, tab_h + 16)) {
-        draw_tabs();
-    }
-    if (y + h > content_y) {
-        switch (active_tab) {
-        case TAB_DASH:
+
+    if (rects_overlap(x, y, w, h, 0, content_y, (int)screen.w, content_h)) {
+        if (active_tab == TAB_DASH)
             draw_dash_content();
-            break;
-        case TAB_SYS:
+        else if (active_tab == TAB_SYS)
             draw_sys_content();
-            break;
-        case TAB_RADIO:
+        else if (active_tab == TAB_RADIO)
             draw_radio_content();
-            break;
-        default:
-            break;
-        }
+        for (int i = 0; i < n_buttons; i++)
+            minui_btn_draw(&screen, &buttons[i]);
     }
-    for (int i = 0; i < n_buttons; i++) {
-        MinuiBtn *b = &buttons[i];
-        if (rects_overlap(x, y, w, h, b->x, b->y, b->w, b->h))
-            minui_btn_draw(&screen, b);
-    }
+    if (rects_overlap(x, y, w, h, 0, 0, (int)screen.w, head_h))
+        draw_header();
+    if (rects_overlap(x, y, w, h, 0, head_h, (int)screen.w, tab_h + 8))
+        draw_tabs();
 }
 
 static void erase_cursor(void)
@@ -546,7 +774,9 @@ static void erase_cursor(void)
 
 static void draw_cursor(int x, int y)
 {
-    minui_circle(&screen, x, y, CUR_R, 0xAA58A6FF);
+    if (y >= content_y + content_h - CUR_PAD)
+        return;
+    minui_circle(&screen, x, y, CUR_R, 0x8858A6FF);
     minui_fill_rect(&screen, x - 2, y - 2, 5, 5, COL_WHITE);
     cur_x = x;
     cur_y = y;
@@ -561,9 +791,10 @@ static void on_tab(int id)
     active_tab = id;
     layout_tabs();
     layout_content_buttons();
+    dash_layout_done = 0;
     content_dirty = 1;
     draw_static_scene();
-    kmsg("tab switch");
+    kmsg_ui("tab switch");
 }
 
 static void on_button(int id)
@@ -571,45 +802,45 @@ static void on_button(int id)
     vib_short();
     switch (id) {
     case 0:
-        snprintf(status_line, sizeof(status_line), "Power off...");
+        snprintf(status_line, sizeof(status_line), "POWER OFF...");
         ui_trigger("/tmp/power.off");
-        kmsg("power off");
+        log_push("UI: POWER OFF");
         break;
     case 1:
-        snprintf(status_line, sizeof(status_line), "Rebooting...");
+        snprintf(status_line, sizeof(status_line), "REBOOT...");
         ui_trigger("/tmp/reboot.warm");
-        kmsg("reboot");
+        log_push("UI: REBOOT");
         break;
     case 2:
-        snprintf(status_line, sizeof(status_line), "Fastboot...");
+        snprintf(status_line, sizeof(status_line), "FASTBOOT...");
         ui_trigger("/tmp/reboot.bootloader");
-        kmsg("fastboot");
+        log_push("UI: FASTBOOT");
         break;
     case 3:
-        snprintf(status_line, sizeof(status_line), "Recovery...");
+        snprintf(status_line, sizeof(status_line), "RECOVERY...");
         ui_trigger("/tmp/reboot.recovery");
-        kmsg("recovery");
+        log_push("UI: RECOVERY");
         break;
     case 10:
         ui_trigger("/tmp/com.on");
-        snprintf(status_line, sizeof(status_line), "COM mode soon");
-        kmsg("com-on");
+        snprintf(status_line, sizeof(status_line), "COM MODE");
+        log_push("UI: COM MODE");
         break;
     case 11:
         vib_short();
         snprintf(status_line, sizeof(status_line), "VIB OK");
-        kmsg("vib");
+        log_push("UI: VIB TEST");
         break;
     case 20:
         ui_trigger("/tmp/radio.start");
-        snprintf(status_line, sizeof(status_line), "Radio starting...");
-        kmsg("radio start");
+        snprintf(status_line, sizeof(status_line), "RADIO START...");
+        log_push("UI: RADIO START");
         break;
     case 21:
         ui_trigger("/tmp/radio.probe");
         metrics_update();
-        snprintf(status_line, sizeof(status_line), "Radio probe");
-        kmsg("radio probe");
+        snprintf(status_line, sizeof(status_line), "RADIO PROBE");
+        log_push("UI: RADIO PROBE");
         break;
     default:
         break;
@@ -629,8 +860,7 @@ void ui_init(UiDrm *ctx)
         .h = ctx->h,
         .stride = ctx->pitch / 4,
     };
-    head_h = 110;
-    layout_safe();
+    layout_metrics();
     layout_tabs();
     touch_fd = touch_open();
     touch_ok = touch_fd >= 0;
@@ -640,11 +870,14 @@ void ui_init(UiDrm *ctx)
         touch_cal.screen_w = (int)ctx->w;
         touch_cal.screen_h = (int)ctx->h;
     }
+    log_push("UI: DASHBOARD READY");
+    log_poll_kmsg();
     metrics_update();
-    last_metrics_ms = 0;
+    metrics_snapshot();
+    last_metrics_ms = monotonic_ms();
     draw_static_scene();
     ctx->dirty = 0;
-    kmsg(touch_ok ? "dashboard init ok" : "dashboard no touch");
+    kmsg_ui(touch_ok ? "dashboard init ok" : "dashboard no touch");
 }
 
 int ui_tick(UiDrm *ctx)
@@ -652,7 +885,7 @@ int ui_tick(UiDrm *ctx)
     (void)ctx;
     int timeout_ms = 1000;
     int moved = 0;
-    unsigned long now_ms = (unsigned long)(frame * 33);
+    unsigned long now_ms = monotonic_ms();
 
     if (touch_fd < 0 && (frame % 120) == 0) {
         touch_fd = touch_open();
@@ -666,18 +899,30 @@ int ui_tick(UiDrm *ctx)
         }
     }
 
-    if (now_ms - last_metrics_ms >= 1000) {
+    log_poll_kmsg();
+
+    if (now_ms - last_metrics_ms >= METRICS_MS) {
         metrics_update();
         last_metrics_ms = now_ms;
-        if (active_tab == TAB_DASH || active_tab == TAB_SYS)
-            draw_content();
+        if (metrics_changed()) {
+            if (active_tab == TAB_DASH)
+                draw_dash_delta();
+            else if (active_tab == TAB_SYS)
+                draw_sys_content();
+            metrics_snapshot();
+            moved = 1;
+        }
+    }
+
+    if (log_dirty) {
+        draw_log_delta();
         moved = 1;
     }
 
     if (touch_fd >= 0) {
         struct pollfd pfd = { .fd = touch_fd, .events = POLLIN };
         if (poll(&pfd, 1, 0) > 0) {
-            timeout_ms = 33;
+            timeout_ms = 50;
             int x, y, down;
             while (touch_read_timeout(touch_fd, &touch_cal, &x, &y, &down, 0)) {
                 int pos_new = down || (x != touch_x || y != touch_y);
@@ -741,13 +986,13 @@ int ui_tick(UiDrm *ctx)
     }
 
     if (strcmp(status_line, status_prev) != 0) {
-        minui_fill_rect(&screen, 0, head_h - 40, (int)screen.w, 32, COL_HEAD);
-        minui_text(&screen, 28, head_h - 36, status_line, COL_ACCENT, 2);
+        minui_fill_rect(&screen, pad_x(), 44, content_w(), 20, COL_HEAD);
+        minui_text(&screen, pad_x(), 46, status_line, COL_ACCENT, 2);
         strncpy(status_prev, status_line, sizeof(status_prev) - 1);
         status_prev[sizeof(status_prev) - 1] = '\0';
         moved = 1;
     }
 
     frame++;
-    return moved ? 33 : timeout_ms;
+    return moved ? 200 : 2000;
 }

@@ -1,0 +1,13 @@
+# Build outputs (built via Makefile → ../out/)
+init
+kms_paint
+wlan_scan
+ffs_adb
+propstub.so
+drm_dump
+*.o
+*.a
+
+# Editor / OS
+*~
+.DS_Store

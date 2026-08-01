@@ -24,11 +24,11 @@ void triggers_poll(void)
     }
     if (access("/tmp/radio.probe", F_OK) == 0) {
         unlink("/tmp/radio.probe");
-        radio_request_async();
+        radio_request_wifi_async();
     }
     if (access("/tmp/radio.start", F_OK) == 0) {
         unlink("/tmp/radio.start");
-        radio_request_async();
+        radio_request_wifi_async();
     }
     if (access("/tmp/radio.scan", F_OK) == 0) {
         unlink("/tmp/radio.scan");

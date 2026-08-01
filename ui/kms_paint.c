@@ -718,8 +718,8 @@ static void hold_forever(void)
     for (int n = 0; ; n++) {
         if (g_ui_mode && g_hold.fb_mem) {
             int ms = ui_tick(&uctx);
-            if (ms < 33)
-                ms = 33;
+            if (ms < 50)
+                ms = 50;
             struct pollfd pfd = { .fd = ui_touch_fd(), .events = POLLIN };
             if (pfd.fd >= 0)
                 poll(&pfd, 1, ms);

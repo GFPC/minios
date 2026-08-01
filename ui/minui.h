@@ -35,6 +35,7 @@ void minui_draw_corner_bezels(MinuiFb *fb, int inset_l, int inset_t,
                               int inset_r, int inset_b, int r, uint32_t bez);
 void minui_circle(MinuiFb *fb, int cx, int cy, int r, uint32_t color);
 void minui_text(MinuiFb *fb, int x, int y, const char *s, uint32_t color, int scale);
+int  minui_text_width(const char *s, int scale);
 void minui_btn_draw(MinuiFb *fb, MinuiBtn *b);
 int  minui_btn_hit(const MinuiBtn *b, int tx, int ty);
 

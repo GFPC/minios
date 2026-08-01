@@ -8,6 +8,7 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 #include "minios/adb.h"
 #include "minios/com.h"
@@ -43,13 +44,31 @@ void dump_udc(void)
     if (!n) klog("USB: /sys/class/udc is EMPTY");
 }
 
-/* Try to force USB peripheral mode on Qualcomm SM6125 */
+/* Disable runtime-PM autosuspend on every usb/dwc3/ssusb platform device under
+ * /sys/devices/platform/soc, one level deep. Device-tree node names/addresses
+ * vary across kernel trees (the previously hardcoded "4e00000.dwc3/dwc3-msm.0"
+ * and "a600000.*" paths never matched this device's actual DT layout —
+ * ssusb@4e00000/dwc3@4e00000 — so the writes silently no-op'd via sysfs_write
+ * and autosuspend stayed enabled, causing the classic 10s "USB device not
+ * recognized" PHY power-toggle failure). Scanning avoids hardcoding guesses.
+ */
+static void usb_disable_autosuspend_at(const char *base)
+{
+    char p[224];
+
+    snprintf(p, sizeof(p), "%s/power/autosuspend_delay_ms", base);
+    sysfs_write(p, "-1");
+    snprintf(p, sizeof(p), "%s/power/control", base);
+    sysfs_write(p, "on");
+    klogf("USB: disabled autosuspend on %s", base);
+}
+
 void usb_force_peripheral(void)
 {
     /* Various paths tried by different kernel/HAL versions */
     const char *paths[] = {
         "/sys/devices/platform/soc/4e00000.dwc3/role",
-        "/sys/devices/platform/soc/a600000.ssusb/role",
+        "/sys/devices/platform/soc/4e00000.ssusb/role",
         "/sys/class/dual_role_usb/dual_role_usb0/mode",
         "/sys/class/typec/port0/data_role",
         NULL
@@ -60,9 +79,60 @@ void usb_force_peripheral(void)
             klogf("USB: wrote peripheral to %s", paths[i]);
         }
     }
-    /* extcon style */
-    sysfs_write("/sys/devices/platform/soc/4e00000.dwc3/dwc3-msm.0/power/autosuspend_delay_ms", "0");
+
+    const char *soc = "/sys/devices/platform/soc";
+    DIR *d = opendir(soc);
+    if (!d) {
+        klog("USB: /sys/devices/platform/soc missing (autosuspend fix skipped)");
+        return;
+    }
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.')
+            continue;
+        if (!strstr(e->d_name, "usb") && !strstr(e->d_name, "dwc3") && !strstr(e->d_name, "ssusb"))
+            continue;
+        char base[192];
+        snprintf(base, sizeof(base), "%s/%s", soc, e->d_name);
+        usb_disable_autosuspend_at(base);
+
+        DIR *d2 = opendir(base);
+        if (!d2)
+            continue;
+        struct dirent *e2;
+        while ((e2 = readdir(d2)) != NULL) {
+            if (e2->d_name[0] == '.')
+                continue;
+            if (!strstr(e2->d_name, "dwc3"))
+                continue;
+            char child[224];
+            snprintf(child, sizeof(child), "%s/%s", base, e2->d_name);
+            usb_disable_autosuspend_at(child);
+        }
+        closedir(d2);
+    }
+    closedir(d);
 }
+/* Unique per-boot serial number. Windows keys its PnP device-instance cache
+ * off the USB serial-number string; a fixed "minios00" means a host that
+ * once failed to enumerate this device (e.g. cached Error state) reuses that
+ * same poisoned instance forever, even across reboots/reflashes. Randomizing
+ * it makes each boot look like a brand-new device to the host. */
+const char *usb_gen_serial(char *buf, size_t len)
+{
+    unsigned int r = 0;
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        if (read(fd, &r, sizeof(r)) != sizeof(r))
+            r = 0;
+        close(fd);
+    }
+    if (!r)
+        r = (unsigned int)getpid() ^ (unsigned int)time(NULL);
+    snprintf(buf, len, "minios%06x", r & 0xffffffu);
+    return buf;
+}
+
 void usb_gadget_reset(void)
 {
     sysfs_write(USB_G "/UDC", "");
@@ -112,6 +182,54 @@ int usb_add_ncm(void)
     klog("USB: no NCM/RNDIS function");
     return -1;
 }
+
+int usb_enable_ncm(void)
+{
+    if (usb_ncm_active)
+        return 0;
+
+    usb_udc_load();
+    if (!usb_udc_name[0])
+        return -1;
+
+    klog("USB: enabling NCM for adb-tcp");
+    sysfs_write(USB_G "/UDC", "");
+    usleep(500000);
+    if (usb_add_ncm() != 0) {
+        sysfs_write(USB_G "/UDC", usb_udc_name);
+        return -1;
+    }
+    sysfs_write(USB_G "/configs/c.1/strings/0x409/configuration", "ACM+NCM");
+    sysfs_write(USB_G "/UDC", usb_udc_name);
+    usleep(500000);
+    return usb_ncm_active ? 0 : -1;
+}
+
+/* Qualcomm DIAG-over-USB gadget function. Instance name MUST be "diag" —
+ * matches DIAG_LEGACY ("diag" in include/linux/usb/usbdiag.h), the channel
+ * name the diag char driver's diag_usb.c registers via usb_diag_open().
+ * Once linked+bound, the kernel's existing /dev/diag transport auto-routes
+ * over USB with no MiniOS-side daemon: lets a real desktop DIAG client
+ * (which does the full session/control-channel handshake our own minimal
+ * ioctl tool can't) capture modem F3 logs directly. Do not run our own
+ * MEMORY_DEVICE_MODE /dev/diag reader at the same time — the driver only
+ * supports one active logging mode. */
+int usb_add_diag(void)
+{
+    const char *fn = USB_G "/functions/diag.diag";
+
+    if (mkdir(fn, 0755) != 0 && errno != EEXIST) {
+        klogf("USB: diag.diag mkdir errno=%d", errno);
+        return -1;
+    }
+    if (usb_link_function("diag.diag") != 0) {
+        klogf("USB: diag.diag link errno=%d", errno);
+        return -1;
+    }
+    klog("USB: diag function linked");
+    return 0;
+}
+
 int usb_add_cser(void)
 {
     /* Lineage willow: CONFIG_USB_CONFIGFS_ACM is off — Qualcomm cser only */
@@ -159,6 +277,41 @@ int usb_open_com_tty(void)
     return fd;
 }
 
+/* Write UDC name to bind the gadget, verify it took, then do a deliberate
+ * unbind+rebind "kick". This second, unraced attempt is what actually makes
+ * enumeration reliable on Windows hosts, which fail "device descriptor
+ * request" outright (no retry) if the very first enumeration races a
+ * controller/PHY that isn't fully settled yet — unlike Linux hosts, which
+ * just retry on their own. Any caller that binds the UDC (cold boot via
+ * usb_bind_udc(), or a live COM->ADB switch via usb_adb_async()) needs this
+ * same robustness, not just the boot path — a leaner, unkicked single-write
+ * bind is exactly what let the runtime ADB switch drop off the bus entirely
+ * with no Windows connection sound at all (confirmed live, twice, same
+ * night this was written). */
+static int usb_udc_bind_verify_kick(const char *name)
+{
+    sysfs_write(USB_G "/UDC", name);
+    usleep(800000);
+    char path[128], rd[64];
+    int n;
+    snprintf(path, sizeof(path), USB_G "/UDC");
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        n = read(fd, rd, sizeof(rd) - 1);
+        close(fd);
+        if (n > 1) {
+            sysfs_write(USB_G "/UDC", "");
+            usleep(400000);
+            sysfs_write(USB_G "/UDC", name);
+            usleep(800000);
+            return 0;
+        }
+    }
+    klog("USB: bind verify failed");
+    sysfs_write(USB_G "/UDC", "");
+    return -1;
+}
+
 int usb_bind_udc(void)
 {
     klog("USB: waiting for UDC (60 s)...");
@@ -166,20 +319,13 @@ int usb_bind_udc(void)
         wdt_pet();
         if (find_udc(usb_udc_name, sizeof(usb_udc_name))) {
             klogf("USB: UDC=%s found at t=%ds", usb_udc_name, i / 10);
-            sysfs_write(USB_G "/UDC", usb_udc_name);
-            usleep(800000);
-            char path[128], rd[64];
-            int n;
-            snprintf(path, sizeof(path), USB_G "/UDC");
-            int fd = open(path, O_RDONLY | O_CLOEXEC);
-            if (fd >= 0) {
-                n = read(fd, rd, sizeof(rd) - 1);
-                close(fd);
-                if (n > 1)
-                    return 0;
-            }
+            /* Let clocks/PHY settle before the first pull-up (see
+             * usb_udc_bind_verify_kick()'s own comment for why). */
+            wdt_pet();
+            usleep(1500000);
+            if (usb_udc_bind_verify_kick(usb_udc_name) == 0)
+                return 0;
             klog("USB: bind verify failed, retry");
-            sysfs_write(USB_G "/UDC", "");
             usb_udc_name[0] = '\0';
             usleep(500000);
         }
@@ -248,7 +394,11 @@ int usb_prepare_adb(void)
 
     if (adb_start_daemon() <= 0)
         return 0;
-    usleep(500000);
+    /* Don't just hope adbd has opened ep0/written its descriptors by a fixed
+     * deadline — actively wait for the kernel to have actually created ep1
+     * (which only happens after that) before linking ffs.adb into the
+     * active config. A blind sleep here raced adbd on a loaded system. */
+    wait_ffs_ep1(5);
 
     if (usb_link_ffs_adb() != 0) {
         usb_stop_adb_daemons();
@@ -274,7 +424,19 @@ int boot_com_requested(void)
     if (n <= 0)
         return 0;
     buf[n] = '\0';
-    return strstr(buf, "minios.usb=com") != NULL;
+    /* NOTE: usb_setup_adb_only() (ffs.adb/FunctionFS path) has an independent
+     * boot-hang bug unrelated to the SD-card mount fix — confirmed by
+     * reproducing the exact same "stuck on splash, no USB ever" symptom
+     * again after forcing ADB here, on a card that was already repaired.
+     * Until that's root-caused, stay on the COM (cser) path, which does
+     * complete enumeration correctly (Windows Code 28 "no driver" is a
+     * separate, easy, host-side fix — not a boot hang). */
+    if (strstr(buf, "minios.usb=com"))
+        return 1;
+    /* ACM initramfs builds always add minios=1 — prefer COM+TCP adb over USB adb-only. */
+    if (strstr(buf, "minios=1"))
+        return 1;
+    return 0;
 }
 
 int usb_adb_postbind(void)
@@ -313,12 +475,20 @@ int usb_setup_adb_only(void)
     sysfs_write(USB_G "/idProduct", "0x4ee7");
     sysfs_write(USB_G "/strings/0x409/manufacturer",           "MiniOS");
     sysfs_write(USB_G "/strings/0x409/product",                "Redmi Note 8T Demo");
-    sysfs_write(USB_G "/strings/0x409/serialnumber",           "minios00");
+    { char ser[32]; sysfs_write(USB_G "/strings/0x409/serialnumber", usb_gen_serial(ser, sizeof(ser))); }
     sysfs_write(USB_G "/configs/c.1/strings/0x409/configuration", "adb");
     sysfs_write(USB_G "/configs/c.1/MaxPower", "500");
 
     if (!usb_prepare_adb())
         return -1;
+
+    /* usb_add_diag() disabled for now — confirmed via Windows Device Manager
+     * (ConfigManagerErrorCode 10, "device cannot start") that adding the
+     * diag.diag function breaks usbser.sys's binding to the cser interface
+     * on this host, even though it bound fine on many boots before this
+     * function existed. Re-enable only once that's root-caused (MEMORY.md
+     * §4.5i/§4.5j) — not needed for the current pd-mapper/wifi test. */
+    /* usb_add_diag(); */
 
     usb_force_peripheral();
     if (usb_bind_udc() != 0)
@@ -344,7 +514,15 @@ int usb_setup_com_only(void)
     if (usb_add_cser() != 0)
         return -1;
 
-    usb_add_ncm();
+    /* Re-enabled for the DIAG-over-USB capture (MEMORY.md §4.5i/§4.5m) —
+     * adding this function breaks Windows' usbser.sys binding to the cser
+     * interface (ConfigManagerErrorCode 10), so this test plan moves the
+     * whole USB device into WSL via usbipd instead of relying on the
+     * Windows COM driver at all. */
+    usb_add_diag();
+
+    /* NCM deferred — composite ACM+NCM can glitch dwc3 on idle WSL/usbipd hosts.
+     * Use COM command `adb-tcp` to bring up NCM + TCP adbd on demand. */
 
     devnodes_ensure_cser();
 
@@ -352,9 +530,8 @@ int usb_setup_com_only(void)
     sysfs_write(USB_G "/idProduct", "0xd001");
     sysfs_write(USB_G "/strings/0x409/manufacturer",           "MiniOS");
     sysfs_write(USB_G "/strings/0x409/product",                "Redmi Note 8T Demo");
-    sysfs_write(USB_G "/strings/0x409/serialnumber",           "minios00");
-    sysfs_write(USB_G "/configs/c.1/strings/0x409/configuration",
-       usb_ncm_active ? "ACM+NCM" : "ACM");
+    { char ser[32]; sysfs_write(USB_G "/strings/0x409/serialnumber", usb_gen_serial(ser, sizeof(ser))); }
+    sysfs_write(USB_G "/configs/c.1/strings/0x409/configuration", "ACM");
     sysfs_write(USB_G "/configs/c.1/MaxPower", "500");
 
     usb_force_peripheral();
@@ -460,7 +637,26 @@ void usb_adb_async(void)
         return;
     }
 
-    sysfs_write(USB_G "/UDC", usb_udc_name);
+    /* usb_bind_udc() (cold-boot path) has this same 1.5s settle delay
+     * right before its first UDC write — "let clocks/PHY settle" — but it
+     * was never carried over here when usb_udc_bind_verify_kick() was
+     * extracted as a shared helper (§4.5am). A live COM->ADB switch leaves
+     * the controller unbound for a while during usb_prepare_adb() (mounts
+     * FunctionFS, starts adbd, can take up to the full adbd-handoff
+     * timeout), then goes straight into the bind/verify/kick sequence with
+     * no settle pause at all — real, reproducible symptom (confirmed twice
+     * via direct SD-card boot.log reads, §4.5ap/this section): "dwc3
+     * ...dwc3: request ... was not queued to ep0out" immediately after
+     * re-enumeration starts, then an unbounded "read descriptors"/"read
+     * strings" host-retry loop that never resolves. Matching the cold-boot
+     * path's own settle delay here is the cheapest, most direct fix to try
+     * first. */
+    usleep(1500000);
+    if (usb_udc_bind_verify_kick(usb_udc_name) != 0) {
+        klog("adb: udc bind failed");
+        usb_restore_com_only();
+        return;
+    }
     if (usb_adb_postbind() != 0) {
         klog("adb: postbind failed");
         usb_restore_com_only();
@@ -498,8 +694,7 @@ int usb_setup(void)
     if (boot_com_requested()) {
         if (usb_setup_com_only() != 0)
             return -1;
-        usb_tcp_adb_async();
-        klog("USB: COM+NCM boot (cmdline minios.usb=com)");
+        klog("USB: COM-only boot (cmdline minios.usb=com, no NCM/adbd until adb-tcp)");
         return 0;
     }
 
@@ -511,6 +706,5 @@ int usb_setup(void)
     klog("USB: ADB-only failed, COM fallback");
     if (usb_setup_com_only() != 0)
         return -1;
-    usb_tcp_adb_async();
     return 0;
 }
