@@ -219,8 +219,8 @@ static void write_boot_marker(void)
         }
     }
     snprintf(line, sizeof(line),
-             "\n======== BOOT #%u src=%s subsys=%s wdt_fd=%d msm_dis=%d ========\n",
-             boot_seq, log_src, subsys, wdt_fd, wdt_msm_disabled);
+             "\n======== BOOT #%u src=%s subsys=%s msm_dis=%d ========\n",
+             boot_seq, log_src, subsys, wdt_msm_disabled);
     append_text(line);
 
     /* Dump current mounts */
@@ -409,8 +409,8 @@ void plog_poll(void)
         }
 
         snprintf(line, sizeof(line),
-                 "[hb boot=%u wdt=%d msm_dis=%d subsys=%s radio=%s]\n",
-                 boot_seq, wdt_fd, wdt_msm_disabled, subsys,
+                 "[hb boot=%u msm_dis=%d subsys=%s radio=%s]\n",
+                 boot_seq, wdt_msm_disabled, subsys,
                  wst[0] ? wst : "?");
         append_text(line);
 

@@ -63,27 +63,30 @@ static void usb_disable_autosuspend_at(const char *base)
     klogf("USB: disabled autosuspend on %s", base);
 }
 
+/* dwc3-msm's own "mode" attribute (kernel/drivers/usb/dwc3/dwc3-msm.c,
+ * dev_attr_mode, accepts "peripheral"/"host") lives on the ssusb@4e00000
+ * platform device itself. The dual_role_usb/typec paths tried here in an
+ * earlier revision were all wrong (wrong node, wrong attribute name "role"
+ * instead of "mode", or a class that has no matching driver on this board
+ * at all) and silently no-op'd for the function's entire lifetime — same
+ * failure mode as the autosuspend fix below, just never caught. */
+static void usb_set_mode_at(const char *base, const char *mode)
+{
+    char p[224];
+
+    snprintf(p, sizeof(p), "%s/mode", base);
+    if (access(p, W_OK) == 0) {
+        sysfs_write(p, mode);
+        klogf("USB: wrote %s to %s", mode, p);
+    }
+}
+
 void usb_force_peripheral(void)
 {
-    /* Various paths tried by different kernel/HAL versions */
-    const char *paths[] = {
-        "/sys/devices/platform/soc/4e00000.dwc3/role",
-        "/sys/devices/platform/soc/4e00000.ssusb/role",
-        "/sys/class/dual_role_usb/dual_role_usb0/mode",
-        "/sys/class/typec/port0/data_role",
-        NULL
-    };
-    for (int i = 0; paths[i]; i++) {
-        if (access(paths[i], W_OK) == 0) {
-            sysfs_write(paths[i], "peripheral");
-            klogf("USB: wrote peripheral to %s", paths[i]);
-        }
-    }
-
     const char *soc = "/sys/devices/platform/soc";
     DIR *d = opendir(soc);
     if (!d) {
-        klog("USB: /sys/devices/platform/soc missing (autosuspend fix skipped)");
+        klog("USB: /sys/devices/platform/soc missing (mode/autosuspend fix skipped)");
         return;
     }
     struct dirent *e;
@@ -95,6 +98,8 @@ void usb_force_peripheral(void)
         char base[192];
         snprintf(base, sizeof(base), "%s/%s", soc, e->d_name);
         usb_disable_autosuspend_at(base);
+        if (strstr(e->d_name, "ssusb"))
+            usb_set_mode_at(base, "peripheral");
 
         DIR *d2 = opendir(base);
         if (!d2)
