@@ -257,7 +257,7 @@ int com_handle(int out, const char *line)
     if (!strcmp(line, "ping"))
         return write(out, "pong\r\n", 6), 1;
     if (!strcmp(line, "help")) {
-        const char *h = "commands: ping help status usb net drm dmesg dmesg-find kms touch touchmon adb adb-tcp adb-on usb-adb com-on ffslog fb radio wifi bt wifi-scan scan-result radio-log cnss-log crash-log qrtr-log pd-log icnss-state binder-state catlog qrtr-lookup diag-klog diag-mdlog qmdl-find vendor-has radio-diag radio-pid qrtr-pid radio-ls wifi-fw metrics save-log sync clean-logs bt-attach modem-state boot-count pstore poweroff reboot recovery mount-debugfs\r\n";
+        const char *h = "commands: ping help status usb net drm dmesg dmesg-find kms touch touchmon adb adb-tcp adb-on usb-adb com-on ffslog fb radio wifi bt wifi-scan scan-result radio-log cnss-log crash-log qrtr-log pd-log icnss-state binder-state catlog qrtr-lookup diag-klog diag-mdlog qmdl-find vendor-has usb-diag proc-info radio-diag radio-pid qrtr-pid radio-ls wifi-fw metrics save-log sync clean-logs bt-attach modem-state boot-count pstore poweroff reboot recovery mount-debugfs\r\n";
         write(out, h, strlen(h));
         return 1;
     }
@@ -400,6 +400,12 @@ int com_handle(int out, const char *line)
     if (!strcmp(line, "com-on") || !strcmp(line, "com on")) {
         usb_restore_com_only();
         write(out, "COM-only restored (re-attach usbipd)\r\n", 41);
+        return 1;
+    }
+    if (!strcmp(line, "usb-diag")) {
+        write(out, "switching to DIAG-only USB (COM will drop now) -- reconnect, then open QXDM\r\n", 79);
+        int rc = usb_setup_diag_only();
+        (void)rc;
         return 1;
     }
     if (!strcmp(line, "adb restart")) {
@@ -671,6 +677,97 @@ int com_handle(int out, const char *line)
         n += snprintf(b + n, sizeof(b) - (size_t)n,
                       "/sys/kernel/debug/icnss exists: %s\r\n",
                       access("/sys/kernel/debug/icnss", F_OK) == 0 ? "yes" : "no");
+        write(out, b, (size_t)n);
+        return 1;
+    }
+    /* proc-info <name>: find a process by /proc/<pid>/comm and dump its
+     * status, wchan (where it's blocked in the kernel right now, if at
+     * all), and open fds (symlink targets -- reveals sockets/binder nodes
+     * it has actually reached, vs strace's uninformative restart_syscall
+     * for this class of daemon). */
+    if (!strncmp(line, "proc-info ", 10)) {
+        const char *name = line + 10;
+        DIR *d = opendir("/proc");
+        char b[3072];
+        int n = 0;
+        int found = 0;
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d)) != NULL) {
+                if (e->d_name[0] < '1' || e->d_name[0] > '9')
+                    continue;
+                char path[64], cmd[64];
+                snprintf(path, sizeof(path), "/proc/%s/comm", e->d_name);
+                int fd = open(path, O_RDONLY);
+                if (fd < 0)
+                    continue;
+                ssize_t rn = read(fd, cmd, sizeof(cmd) - 1);
+                close(fd);
+                if (rn <= 0)
+                    continue;
+                cmd[rn] = '\0';
+                char *nl = strchr(cmd, '\n');
+                if (nl) *nl = '\0';
+                if (strcmp(cmd, name) != 0)
+                    continue;
+                found = 1;
+                n += snprintf(b + n, sizeof(b) - (size_t)n, "pid=%s comm=%s\r\n", e->d_name, cmd);
+
+                snprintf(path, sizeof(path), "/proc/%s/status", e->d_name);
+                fd = open(path, O_RDONLY);
+                if (fd >= 0) {
+                    char rb[1024];
+                    rn = read(fd, rb, sizeof(rb) - 1);
+                    close(fd);
+                    if (rn > 0) {
+                        rb[rn] = '\0';
+                        char *line2 = rb;
+                        while (line2 && *line2 && n < (int)sizeof(b) - 200) {
+                            char *nl2 = strchr(line2, '\n');
+                            if (nl2) *nl2 = '\0';
+                            if (!strncmp(line2, "State:", 6) || !strncmp(line2, "PPid:", 5) ||
+                                !strncmp(line2, "Threads:", 8) || !strncmp(line2, "VmRSS:", 6))
+                                n += snprintf(b + n, sizeof(b) - (size_t)n, "%s\r\n", line2);
+                            line2 = nl2 ? nl2 + 1 : NULL;
+                        }
+                    }
+                }
+
+                snprintf(path, sizeof(path), "/proc/%s/wchan", e->d_name);
+                fd = open(path, O_RDONLY);
+                if (fd >= 0) {
+                    char rb[128];
+                    rn = read(fd, rb, sizeof(rb) - 1);
+                    close(fd);
+                    if (rn > 0) {
+                        rb[rn] = '\0';
+                        n += snprintf(b + n, sizeof(b) - (size_t)n, "wchan=%s\r\n", rb);
+                    }
+                }
+
+                snprintf(path, sizeof(path), "/proc/%s/fd", e->d_name);
+                DIR *fdd = opendir(path);
+                if (fdd) {
+                    struct dirent *fe;
+                    while ((fe = readdir(fdd)) != NULL && n < (int)sizeof(b) - 160) {
+                        if (fe->d_name[0] == '.')
+                            continue;
+                        char fp[96], target[96];
+                        snprintf(fp, sizeof(fp), "%s/%s", path, fe->d_name);
+                        ssize_t ln = readlink(fp, target, sizeof(target) - 1);
+                        if (ln > 0) {
+                            target[ln] = '\0';
+                            n += snprintf(b + n, sizeof(b) - (size_t)n, "fd/%s -> %s\r\n", fe->d_name, target);
+                        }
+                    }
+                    closedir(fdd);
+                }
+                n += snprintf(b + n, sizeof(b) - (size_t)n, "---\r\n");
+            }
+            closedir(d);
+        }
+        if (!found)
+            n = snprintf(b, sizeof(b), "no process named %s\r\n", name);
         write(out, b, (size_t)n);
         return 1;
     }

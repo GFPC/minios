@@ -342,7 +342,16 @@ int main(void)
     mknod("/dev/console", S_IFCHR|0600, makedev(5,1));
     mknod("/dev/null",    S_IFCHR|0666, makedev(1,3));
     mknod("/dev/zero",    S_IFCHR|0666, makedev(1,5));
-    mknod("/dev/kmsg",    S_IFCHR|0600, makedev(1,11));
+    mknod("/dev/kmsg",    S_IFCHR|0620, makedev(1,11));
+    /* mknod()'s mode is a no-op if devtmpfs already auto-created the node
+     * (same class of race as /dev/zero/uio* elsewhere in this function) —
+     * chmod/chown explicitly so this applies regardless. root:system 0620
+     * matches real ueventd.rc; without it, any daemon that drops to
+     * uid=1000/gid=1000 ("system", e.g. cnss-daemon) gets EACCES trying to
+     * write /dev/kmsg (confirmed via cnss.exec.log: "sh: can't create
+     * /dev/kmsg: Permission denied"). */
+    chmod("/dev/kmsg", 0620);
+    chown("/dev/kmsg", 0, 1000);
     mknod("/dev/urandom", S_IFCHR|0666, makedev(1,9));
 
     klog("=== MINIOS START ===");

@@ -549,6 +549,45 @@ int usb_setup_com_only(void)
     return 0;
 }
 
+/* Diag-only composition: no cser/ACM function at all, so there is no
+ * composite-enumeration conflict for Windows' usbser.sys to fail on
+ * (the ConfigManagerErrorCode 10 issue documented on usb_add_diag() /
+ * usb_setup_adb_only() only happens when diag.diag shares a config with
+ * cser). Distinct VID:PID (Qualcomm's own 0x05c6, generic diag PID 0x9091,
+ * matching the same IDs stock Qualcomm diag-mode composite devices use)
+ * so Windows doesn't reuse a cached failed driver binding from the
+ * 18d1:d001 COM composition, and so the Qualcomm USB diag driver (if
+ * installed) has a real hardware-ID match to bind to for a QXDM session. */
+int usb_setup_diag_only(void)
+{
+    klog("USB: DIAG-only boot");
+    usb_gadget_reset();
+    usb_config_clear_links();
+    sysfs_mkdir(USB_G);
+    sysfs_mkdir(USB_G "/strings/0x409");
+    sysfs_mkdir(USB_G "/configs/c.1");
+    sysfs_mkdir(USB_G "/configs/c.1/strings/0x409");
+
+    if (usb_add_diag() != 0)
+        return -1;
+
+    sysfs_write(USB_G "/idVendor",  "0x05c6");
+    sysfs_write(USB_G "/idProduct", "0x9091");
+    sysfs_write(USB_G "/strings/0x409/manufacturer",           "Qualcomm CDMA Technologies MSM");
+    sysfs_write(USB_G "/strings/0x409/product",                "Redmi Note 8T Diag");
+    { char ser[32]; sysfs_write(USB_G "/strings/0x409/serialnumber", usb_gen_serial(ser, sizeof(ser))); }
+    sysfs_write(USB_G "/configs/c.1/strings/0x409/configuration", "diag");
+    sysfs_write(USB_G "/configs/c.1/MaxPower", "500");
+
+    usb_force_peripheral();
+    if (usb_bind_udc() != 0)
+        return -1;
+
+    usb_com_active = 0;
+    klog("USB: BOUND DIAG");
+    return 0;
+}
+
 void usb_config_clear_links(void)
 {
     char path[256];

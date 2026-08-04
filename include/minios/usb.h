@@ -23,5 +23,7 @@ void usb_com_maintain(void);
 void usb_rebind_request(void);
 int usb_enable_ncm(void);
 int usb_add_diag(void);
+int usb_setup_diag_only(void);
+void usb_config_clear_links(void);
 
 #endif
