@@ -131,6 +131,78 @@ void com_dmesg_find(int out, const char *needle, int max_matches)
         write(out, "no match\r\n", 10);
 }
 
+/* Binary-safe substring search over diag_mdlog's .qmdl output in
+ * /tmp/diagmdlog -- unlike com_dmesg_find, these files are not
+ * line-oriented text, so this scans the raw bytes for `needle` and prints
+ * a fixed-size printable-only window around each hit (binary noise
+ * replaced with '.') instead of trying to print whole "lines". */
+static void qmdl_scan_buf(int out, const char *buf, size_t total,
+                           const char *needle, size_t nlen, int *matches,
+                           int max_matches)
+{
+    const size_t ctx = 48;
+
+    for (size_t i = 0; i + nlen <= total && *matches < max_matches; i++) {
+        if (memcmp(buf + i, needle, nlen) != 0)
+            continue;
+        size_t start = (i > ctx) ? i - ctx : 0;
+        size_t end = (i + nlen + ctx < total) ? i + nlen + ctx : total;
+        char snip[2 * 48 + 64 + 8];
+        size_t n = end - start;
+        if (n > sizeof(snip) - 1)
+            n = sizeof(snip) - 1;
+        for (size_t j = 0; j < n; j++) {
+            unsigned char c = (unsigned char)buf[start + j];
+            snip[j] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+        }
+        snip[n] = '\0';
+        write(out, snip, n);
+        write(out, "\r\n", 2);
+        (*matches)++;
+        i = end > 0 ? end - 1 : i;
+    }
+}
+
+void com_qmdl_find(int out, const char *needle, int max_matches)
+{
+    DIR *d = opendir("/tmp/diagmdlog");
+    if (!d) {
+        write(out, "no /tmp/diagmdlog (diag_mdlog not run yet?)\r\n", 46);
+        return;
+    }
+    size_t nlen = needle ? strlen(needle) : 0;
+    if (nlen == 0) {
+        write(out, "no pattern\r\n", 12);
+        closedir(d);
+        return;
+    }
+    static char buf[2 * 1024 * 1024];
+    int matches = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL && matches < max_matches) {
+        if (e->d_name[0] == '.')
+            continue;
+        char path[192];
+        snprintf(path, sizeof(path), "/tmp/diagmdlog/%s", e->d_name);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0)
+            continue;
+        ssize_t total = 0;
+        while (total < (ssize_t)sizeof(buf)) {
+            ssize_t n = read(fd, buf + total, sizeof(buf) - (size_t)total);
+            if (n <= 0)
+                break;
+            total += n;
+        }
+        close(fd);
+        if (total > 0)
+            qmdl_scan_buf(out, buf, (size_t)total, needle, nlen, &matches, max_matches);
+    }
+    closedir(d);
+    if (matches == 0)
+        write(out, "no match\r\n", 10);
+}
+
 void com_read_file_out(int out, const char *path, const char *missing)
 {
     int fd = open(path, O_RDONLY);
@@ -185,7 +257,7 @@ int com_handle(int out, const char *line)
     if (!strcmp(line, "ping"))
         return write(out, "pong\r\n", 6), 1;
     if (!strcmp(line, "help")) {
-        const char *h = "commands: ping help status usb net drm dmesg dmesg-find kms touch touchmon adb adb-tcp adb-on usb-adb com-on ffslog fb radio wifi bt wifi-scan scan-result radio-log cnss-log crash-log qrtr-log pd-log icnss-state binder-state catlog qrtr-lookup diag-klog radio-diag radio-pid qrtr-pid radio-ls wifi-fw metrics save-log sync clean-logs bt-attach modem-state boot-count pstore poweroff reboot recovery mount-debugfs\r\n";
+        const char *h = "commands: ping help status usb net drm dmesg dmesg-find kms touch touchmon adb adb-tcp adb-on usb-adb com-on ffslog fb radio wifi bt wifi-scan scan-result radio-log cnss-log crash-log qrtr-log pd-log icnss-state binder-state catlog qrtr-lookup diag-klog diag-mdlog qmdl-find vendor-has radio-diag radio-pid qrtr-pid radio-ls wifi-fw metrics save-log sync clean-logs bt-attach modem-state boot-count pstore poweroff reboot recovery mount-debugfs\r\n";
         write(out, h, strlen(h));
         return 1;
     }
@@ -675,6 +747,23 @@ int com_handle(int out, const char *line)
     if (!strcmp(line, "diag-klog")) {
         start_diag_klog();
         write(out, "diag_klog started — modem F3 log routed to dmesg, check: dmesg-find <term>\r\n", 78);
+        return 1;
+    }
+    if (!strcmp(line, "diag-mdlog")) {
+        start_diag_mdlog();
+        write(out, "diag_mdlog started -> /tmp/diagmdlog (.qmdl files)\r\n", 53);
+        return 1;
+    }
+    if (!strncmp(line, "qmdl-find ", 10)) {
+        com_qmdl_find(out, line + 10, 40);
+        return 1;
+    }
+    if (!strncmp(line, "vendor-has ", 11)) {
+        const char *found = vendor_bin(line + 11);
+        char b[220];
+        int n = snprintf(b, sizeof(b), "%s: %s\r\n", line + 11,
+                          found ? found : "not found");
+        write(out, b, (size_t)n);
         return 1;
     }
     if (!strcmp(line, "radio-diag")) {

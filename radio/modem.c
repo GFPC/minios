@@ -295,6 +295,38 @@ void start_diag_klog(void)
     plog_append(p > 0 ? "diag_klog: started" : "diag_klog: start failed");
 }
 
+/* diag_klog (above) turned out to be a klog->diag *forwarder* (reads the
+ * AP's own kernel log via klogctl(SYSLOG_ACTION_READ) and pushes it out
+ * over diag) -- confirmed via Ghidra decompile of its main(), not a way to
+ * see modem-side messages at all. diag_mdlog is the real modem log
+ * capture tool (writes .qmdl files); run with no mask file (-f) for a
+ * default capture -- some F3 messages carry literal ASCII text even
+ * without a proper QCAT/QXDM message database, so a binary substring
+ * search on the .qmdl may already show something readable. Output goes
+ * to /tmp (tmpfs, always available, no removable-media mount fragility)
+ * -- read back over COM via the qmdl-find command (com.c), no physical
+ * SD swap needed. Small -s cap since this is RAM-backed. */
+void start_diag_mdlog(void)
+{
+    if (proc_running("diag_mdlog"))
+        return;
+    const char *bin = stage_vendor_bin("diag_mdlog");
+    if (!bin) {
+        LOGI("radio", "%s", "diag_mdlog: not found on vendor");
+        return;
+    }
+    mkdir("/tmp/diagmdlog", 0755);
+    char *argv[] = {
+        (char *)"diag_mdlog",
+        (char *)"-o", (char *)"/tmp/diagmdlog",
+        (char *)"-s", (char *)"2",
+        NULL
+    };
+    pid_t p = start_vendor_daemon(bin, argv);
+    LOGI("radio", "diag_mdlog: start pid=%d", (int)p);
+    plog_append(p > 0 ? "diag_mdlog: started" : "diag_mdlog: start failed");
+}
+
 /* Both daemons above used to only start deep inside boot_modem(), which
  * itself (per §4.5v) now deliberately runs LAST — after qrtr-ns/pd-mapper/
  * cnss-daemon are already up, to match real-ROM's observed modem-PIL-

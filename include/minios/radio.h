@@ -17,6 +17,8 @@ void radio_early_modem_boot(void);
 void radio_stage_early_bins(void);
 void radio_probe_now(void);
 void start_diag_klog(void);
+void start_diag_mdlog(void);
+const char *vendor_bin(const char *name);
 
 void radio_scan_request_async(void);
 void radio_poll(void);
