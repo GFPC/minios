@@ -17,7 +17,14 @@
 #include <linux/atomic.h>
 
 #define QS_MAX_DUMP 64
-#define QS_MAX_PKTS 2000  /* hard cap so a chatty boot can't flood dmesg forever */
+/* Was 2000 — real-ROM captures showed that's exhausted by ~7s of chatty
+ * QRTR traffic (t=8.5s module load to t=15.9s cap, MEMORY.md §4.5av),
+ * long before MiniOS's own modem-reset (~t=78s) or panic (~t=118s) points
+ * it actually needs to span. Raised 10x: at the same ~270 pkt/s burst rate
+ * each hexdump line is up to ~250 bytes, so 20000 lines is at most ~5MB —
+ * leaves headroom in the 8MB log_buf_len ring for everything else MiniOS
+ * already logs during a ~2 minute boot. */
+#define QS_MAX_PKTS 20000
 
 static atomic_t qs_count = ATOMIC_INIT(0);
 

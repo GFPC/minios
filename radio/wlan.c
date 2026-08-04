@@ -182,23 +182,74 @@ void configure_wlan_driver(void)
     usleep(200000);
     wf_checked("/sys/module/wlan/parameters/con_mode", "0");
 
-    /* Create /dev/wlan (major 500) and write "ON" to trigger
-     * hdd_driver_load() in the QCA CLD3 driver.
+    /* Create /dev/wlan and write "ON" to trigger hdd_driver_load() in the
+     * QCA CLD3 driver.
      *
-     * CRITICAL: write ON only AFTER ICNSS_FW_READY is set.
-     * FW_READY comes ~15-25s after cnss-daemon's wlfw_start via QMI.
-     * Writing ON before FW_READY → icnss_wlan_enable() returns -EINVAL
-     * → wlan_start_comp times out (20s) → wlan0 never appears.
-     *
-     * We wait here; if debugfs has icnss/state we detect the bit,
-     * otherwise we rely on the caller's timed wait. */
-    if (!path_exists("/dev/wlan")) {
-        if (mknod("/dev/wlan", S_IFCHR | 0666, makedev(500, 0)) == 0)
-            LOGI("radio", "%s", "wlan: /dev/wlan mknod ok");
-        else {
-            char m[80];
-            snprintf(m, sizeof(m), "wlan: mknod errno=%d", errno);
+     * The wlan_hdd_state control device is registered via
+     * alloc_chrdev_region() — a DYNAMIC major, not a fixed one. The old
+     * hardcoded major=500 here (carried over from legacy prima/wcnss_wlan
+     * drivers) was confirmed live to mismatch the real major (kernel logs
+     * "wlan_hdd_state wlan major(501) initialized"), so every previous
+     * open()+write("ON") on this node silently went to a bogus device —
+     * mknod() itself doesn't fail, so this broke with zero error output.
+     * Look the real major up in /proc/devices instead, and always
+     * re-create the node if a stale one exists with the wrong major. */
+    {
+        /* Registered name in /proc/devices is "qcwlanstate", NOT "wlan" —
+         * confirmed by reading the actual driver source
+         * (kernel/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_main.c,
+         * wlan_hdd_state_ctrl_param_create(): alloc_chrdev_region(&device,
+         * 0, dev_num, "qcwlanstate")). The kernel's own boot-time log line
+         * ("wlan_hdd_state wlan major(%d) initialized") is misleadingly
+         * named and does NOT reflect the /proc/devices key. Looking up
+         * "wlan" here therefore never matched, always fell through to the
+         * broken legacy major=500 fallback below, and every /dev/wlan
+         * open() this project has ever done failed with ENXIO — silently,
+         * since mknod() itself doesn't care whether the major is real.
+         * Confirmed live this session via a new plog breadcrumb: "wlan:
+         * /dev/wlan major=500 need_mknod=1" immediately followed by "wlan:
+         * /dev/wlan open errno=6 attempt=0" (ENXIO), while the real major
+         * was 501. This one-line fix may be the actual root cause behind
+         * the whole project's "modem panics ~40s after reset" mystery —
+         * hdd_driver_load()/wlan_hdd_register_driver() (qcacld's own WLAN
+         * bring-up entry point) can never have run even once before this,
+         * since the "ON" write that triggers it never reached the real
+         * device. */
+        int wlan_major = get_chrdev_major("qcwlanstate");
+        struct stat st;
+        int need_mknod = 1;
+
+        if (wlan_major < 0) {
+            LOGI("radio", "%s", "wlan: /proc/devices has no 'wlan' entry yet, falling back to major=500");
+            wlan_major = 500;
+        } else {
+            char m[64];
+            snprintf(m, sizeof(m), "wlan: /proc/devices wlan major=%d", wlan_major);
             LOGI("radio", "%s", m);
+        }
+
+        if (stat("/dev/wlan", &st) == 0) {
+            if (S_ISCHR(st.st_mode) && (int)major(st.st_rdev) == wlan_major) {
+                need_mknod = 0;
+            } else {
+                unlink("/dev/wlan");
+            }
+        }
+
+        if (need_mknod) {
+            if (mknod("/dev/wlan", S_IFCHR | 0666, makedev(wlan_major, 0)) == 0) {
+                LOGI("radio", "%s", "wlan: /dev/wlan mknod ok");
+            } else {
+                char m[80];
+                snprintf(m, sizeof(m), "wlan: mknod errno=%d", errno);
+                LOGI("radio", "%s", m);
+                plog_append(m);
+            }
+        }
+        {
+            char m[96];
+            snprintf(m, sizeof(m), "wlan: /dev/wlan major=%d need_mknod=%d", wlan_major, need_mknod);
+            plog_append(m);
         }
     }
 
@@ -222,18 +273,36 @@ void configure_wlan_driver(void)
             char m[80];
             snprintf(m, sizeof(m), "wlan: /dev/wlan open errno=%d attempt=%d", errno, attempt);
             LOGI("radio", "%s", m);
+            plog_append(m);
             continue;
         }
-        ssize_t n = write(fd, "ON", 2);
-        close(fd);
-        if (n == 2) {
-            LOGI("radio", "%s", "wlan: /dev/wlan=ON sent");
-            break; /* write accepted — wait for wlan0 in caller */
-        }
+        /* wlan_hdd_state_ctrl_param_write() (kernel) unconditionally does
+         * copy_from_user(buf, user_buf, 3) — a hardcoded 3, ignoring the
+         * actual write() count — so it always tries to read a 3rd byte
+         * past whatever we send. Sending only "ON" (2 bytes) makes that a
+         * 1-byte user-space overread of our own buffer: harmless if the
+         * adjacent byte happens to be mapped (usual case on a stack), but
+         * copy_from_user() returning -EFAULT there would make the kernel
+         * bail out with -EINVAL before ever reaching hdd_driver_load()/
+         * wlan_hdd_register_driver() — a silent, non-obvious way for the
+         * whole WiFi bring-up to never start. Pad to a real 3-byte buffer
+         * so the kernel's read is always fully in-bounds. */
+        ssize_t n = write(fd, "ON\0", 3);
         {
-            char m[80];
-            snprintf(m, sizeof(m), "wlan: /dev/wlan write failed n=%d attempt=%d", (int)n, attempt);
-            LOGI("radio", "%s", m);
+            int werrno = errno;
+            close(fd);
+            if (n >= 2) {
+                LOGI("radio", "%s", "wlan: /dev/wlan=ON sent");
+                plog_append("wlan: /dev/wlan=ON sent");
+                break; /* write accepted — wait for wlan0 in caller */
+            }
+            {
+                char m[96];
+                snprintf(m, sizeof(m), "wlan: /dev/wlan write failed n=%d errno=%d attempt=%d",
+                         (int)n, werrno, attempt);
+                LOGI("radio", "%s", m);
+                plog_append(m);
+            }
         }
     }
 }
@@ -479,7 +548,88 @@ void try_wlan_enable(void)
      * even though fsync'd data landed on the card. These checkpoints are
      * cheap enough to persist this way without the same risk. */
     plog_append("wlan: start_cnss_stack()");
+    radio_trace("wlan: start_cnss_stack");
     start_cnss_stack();
+    radio_dump_qrtr("post start_cnss_stack");
+
+    /* CRITICAL ORDERING FIX (see MEMORY.md #4.5au): the OLD order here was
+     * cnss-daemon-wait -> wait_for_wlfw(40) -> wait_icnss_fw_ready(35) ->
+     * trigger_wlan_power()/configure_wlan_driver(). That is backwards and
+     * created a real deadlock, confirmed live via a captured pstore panic +
+     * a byte-exact qrtr-snoop trace: icnss_probe() only registers the
+     * platform-driver shell at kernel boot ("icnss: Platform driver probed
+     * successfully" at t=0.99s in a captured dmesg) — it does NOT touch the
+     * WCN3990 hardware or register the wlfw QMI service on its own. Nothing
+     * else in the kernel does either: actually powering the chip (PCIe/
+     * memory-mapped enumeration + wlfw registration) only happens as a
+     * *consequence* of hdd_driver_load(), which only runs once userspace
+     * writes "ON" to /dev/wlan via configure_wlan_driver(). So wlfw can
+     * structurally never appear during wait_for_wlfw(40) — that whole 40s
+     * is guaranteed wasted, every single boot (confirmed: wlfw=0 for the
+     * full 40s in every "modem_watch" trace all night, no exceptions).
+     * Worse: the modem itself panics ("Fatal error on modem!") almost
+     * exactly 40.05s after "Brought out of reset" in the one boot where a
+     * pstore panic dump was actually captured — its own last QMI activity
+     * before that silent 40s gap was the tms/pdr_enabled + wlan_pd
+     * REGISTER_LISTENER exchange, right at reset. The modem is very likely
+     * running its own bailout timer waiting for the AP to bring up WLFW/
+     * WCN3990 within that window — and our code doesn't even attempt to
+     * power the chip until ~75s+ in (40s + 35s of guaranteed-empty waits
+     * later), well past the modem's own deadline.
+     *
+     * Fix: power the chip and write ON to /dev/wlan immediately after
+     * start_cnss_stack() returns (i.e. right after boot_modem() has
+     * already triggered modem PIL) — BEFORE any of the wlfw/fw_ready
+     * waits, not after. All the sysfs paths configure_wlan_driver() and
+     * trigger_wlan_power() touch belong to the qcacld "wlan" module, which
+     * is built directly into this kernel (minios.skip_ko=1) — its sysfs
+     * parameter files and /proc/devices chrdev entry exist from kernel
+     * boot, not from any userspace daemon, so calling this earlier is
+     * safe and has no other new dependency. */
+    /* UPDATE (this session, live usb_ctl.py history analysis): triggering
+     * RF power at 0s right here (immediately after start_cnss_stack()
+     * returns) was tried and made things WORSE, not better. Confirmed via
+     * usb_ctl.py's passive Windows-side USB connect/disconnect history
+     * (untouched by any COM traffic, so not an artifact of our own
+     * polling): the SoC reboot cycle became a rock-solid, reproducible
+     * ~121s from USB enumeration every single time (vs ~178s / "40s after
+     * modem out-of-reset" before this change) -- i.e. the crash now
+     * happens only ~16s after "Brought out of reset" (dmesg-find
+     * consistently shows t~=105.3-105.5s boot time across many boots)
+     * instead of ~40s after. "Brought out of reset" only means the PIL
+     * hardware reset line was released -- the modem's own MPSS
+     * firmware/software stack is not necessarily fully up yet at that
+     * instant. Racing configure_wlan_driver()'s hardware bring-up (WCN3990
+     * is memory-mapped on this SoC/DTB, not PCIe -- see trinket.dtsi
+     * qcom,icnss@C800000) at that exact moment most likely collides with
+     * the modem's own in-progress boot (shared clocks/rails/bus),
+     * producing a NEW, faster crash instead of fixing the old one. pstore
+     * came up completely empty both times (no ramoops files at all after
+     * either crash), so we have no captured backtrace for either failure
+     * mode -- only the precise, reproducible timing from usb_ctl.py.
+     *
+     * Fix (this iteration): give the modem a bounded ~20s head start after
+     * boot_modem() before touching WLAN hardware -- long enough to be past
+     * the immediate post-reset window that reproducibly crashed at ~16s,
+     * nowhere near the old 75s+ (cnss-daemon-wait + wlfw 40s + fw_ready
+     * 35s) that produced the original ~178s/40s-after-reset panic. Still
+     * an empirical guess, not a confirmed root cause -- if it neither
+     * prevents nor meaningfully delays the crash again, next step should
+     * be getting pstore to actually capture a backtrace (console-ramoops,
+     * bigger ramoops DTB region) instead of guessing another delay blind. */
+    plog_append("wlan: post-boot_modem settle wait (~20s, bounded)");
+    for (int i = 0; i < 40; i++) {
+        wdt_pet();
+        usleep(500000);
+    }
+    plog_append("wlan: settle wait done");
+
+    LOGI("radio", "%s", "wlan: RF power on (post-settle, ~20s after boot_modem)");
+    plog_append("wlan: RF power on (trigger_wlan_power, post-settle)");
+    trigger_wlan_power();
+
+    plog_append("wlan: configure_wlan_driver() (post-settle)");
+    configure_wlan_driver();
 
     /* Wait for cnss-daemon to be alive (up to 90s).
      * Extended from 60s — vendor mount + qrtr-ns start can be slow. */
@@ -499,21 +649,10 @@ void try_wlan_enable(void)
         plog_append(line);
     }
 
-    /* CRITICAL ORDERING FIX:
-     * wait_for_wlfw must run AFTER cnss-daemon is confirmed alive.
-     * wlfw (service 0x45) only appears in QRTR after cnss-daemon sends
-     * wlfw_start via QMI.  Calling wait_for_wlfw before daemon is up
-     * wastes the entire timeout and we write ON too early → Timed-out!!
-     *
-     * Correct order:
-     *   1. cnss-daemon alive
-     *   2. wait wlfw in QRTR (daemon just sent wlfw_start)
-     *   3. wait ICNSS_FW_READY bit (modem loaded WiFi FW, ~15-25s)
-     *   4. write ON to /dev/wlan
-     */
     LOGI("radio", "%s", "wlan: waiting for wlfw in QRTR (max 40s)...");
     plog_append("wlan: waiting for wlfw in QRTR (max 40s)");
     int have_wlfw = wait_for_wlfw(40);
+    radio_dump_qrtr("post wlfw wait");
     {
         char line[64];
         snprintf(line, sizeof(line), "wlan: wlfw_seen=%d", have_wlfw);
@@ -529,12 +668,6 @@ void try_wlan_enable(void)
         plog_append(line);
     }
 
-    LOGI("radio", "%s", "wlan: RF power on");
-    plog_append("wlan: RF power on (trigger_wlan_power)");
-    trigger_wlan_power();
-
-    plog_append("wlan: configure_wlan_driver()");
-    configure_wlan_driver();
     plog_append("wlan: waiting for wlan0 iface (90s max)");
     wait_for_iface("/sys/class/net/wlan0", 90);
     {

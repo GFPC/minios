@@ -33,5 +33,6 @@ int radio_format_find(const char *needle, char *buf, size_t bufsz);
 int radio_format_icnss(char *buf, size_t bufsz);
 int radio_format_binder(char *buf, size_t bufsz);
 int radio_format_pidinfo(char *buf, size_t bufsz);
+int radio_format_qrtr_pidinfo(char *buf, size_t bufsz);
 
 #endif

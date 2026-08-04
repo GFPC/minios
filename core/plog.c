@@ -456,7 +456,10 @@ void plog_save_tmp_logs(void)
 {
     static const char *srcs[] = {
         "/tmp/radio.log",
+        "/tmp/radio_trace.log",
         "/tmp/cnss.exec.log",
+        "/mnt/sdcard/minios/qmi_trace.log",
+        "/tmp/qmi_trace.log",
         "/tmp/qrtr-ns.log",
         "/tmp/pd-mapper.log",
         "/tmp/radio.status",

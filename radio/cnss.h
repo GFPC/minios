@@ -7,7 +7,13 @@
 void ensure_cnss_devnodes(void);
 void cnss_log_exit(pid_t pid);
 void cnss_log_line(const char *msg);
+void write_qrtr_pid_file(pid_t pid);
 void cnss_drop_to_system(void);
+void cnss_drop_to_vendor_qrtr(void);
+void cnss_drop_to_pd_mapper(void);
+void start_logd_stub(void);
+void cnss_drop_privileges(uid_t uid, gid_t gid, const gid_t *groups, int ngroups,
+                           unsigned keep_cap, const char *label);
 void cnss_log_argv(const char *run, char *const argv[]);
 int exec_via_linker64(const char *run, char *const argv[]);
 int cnss_try_exec(const char *run, char *const argv[]);
@@ -17,7 +23,11 @@ pid_t cnss_spawn_variant(const char *run, char *const argv[], const char *label)
 pid_t start_cnss_daemon(const char *path);
 void daemon_child_setup(const char *path, const char *logfile);
 pid_t start_vendor_daemon(const char *path, char *const argv[]);
+pid_t start_vendor_daemon_dropped(const char *path, char *const argv[], void (*drop)(void));
 void run_vendor_oneshot(const char *path, char *const argv[]);
+/* Bounded wait — kills child after timeout_sec (SIGKILL). Returns 0 if exited,
+ * 1 on timeout/kill, -1 if start failed. */
+int run_vendor_oneshot_timeout(const char *path, char *const argv[], int timeout_sec);
 void stage_cnss_libs(void);
 void ensure_binder_nodes(void);
 void start_binder_services(void);

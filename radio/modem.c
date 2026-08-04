@@ -4,9 +4,12 @@
 #include "radio_state.h"
 #include "radio_utils.h"
 #include "cnss.h"
+#include "wlan.h"
+#include "firmware.h"
 #include "minios/log.h"
 #include "minios/watchdog.h"
 #include "minios/plog.h"
+#include "radio_utils.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
@@ -114,7 +117,27 @@ void try_load_qrtr_snoop(void)
             continue;
         if (load_ko_file(paths[i]) == 0) {
             LOGI("radio", "%s %s", "qrtr_snoop ko ok", paths[i]);
-            return;
+            break;
+        }
+    }
+
+    /* Diagnostic (MEMORY.md §4.5ay): filtered do_filp_open kprobe, checks
+     * whether MiniOS's own irsc_util reaches the same persist/rfs/modemst
+     * EFS-sync paths real Android's irsc_util opens right before WLAN FW
+     * ready. Same best-effort loading pattern as qrtr_snoop above. */
+    {
+        const char *ospaths[] = {
+            "/lib/open_snoop.ko",
+            "/lib/modules/open_snoop.ko",
+            NULL,
+        };
+        for (int i = 0; ospaths[i]; i++) {
+            if (access(ospaths[i], R_OK) != 0)
+                continue;
+            if (load_ko_file(ospaths[i]) == 0) {
+                LOGI("radio", "%s %s", "open_snoop ko ok", ospaths[i]);
+                break;
+            }
         }
     }
 }
@@ -200,6 +223,17 @@ static void start_rmt_storage(void)
     char *argv[] = { (char *)"rmt_storage", NULL };
     pid_t p = start_vendor_daemon(bin, argv);
     LOGI("radio", "rmt_storage: start pid=%d", (int)p);
+    plog_append(p > 0 ? "rmt_storage: started" : "rmt_storage: start failed");
+    if (p > 0) {
+        char rmsg[128];
+        if (reap_child_status_poll(p, "rmt_storage", rmsg, sizeof(rmsg), 2000)) {
+            LOGI("radio", "%s", rmsg);
+            plog_append(rmsg);
+        } else if (!proc_running("rmt_storage")) {
+            LOGI("radio", "%s", "rmt_storage: died early (status unknown)");
+            plog_append("rmt_storage: died early (status unknown)");
+        }
+    }
 }
 
 /* Real ROM starts this unconditionally too: vendor.qti.tftp.rc, class core,
@@ -225,6 +259,17 @@ static void start_tftp_server(void)
     char *argv[] = { (char *)"tftp_server", NULL };
     pid_t p = start_vendor_daemon(bin, argv);
     LOGI("radio", "tftp_server: start pid=%d", (int)p);
+    plog_append(p > 0 ? "tftp_server: started" : "tftp_server: start failed");
+    if (p > 0) {
+        char rmsg[128];
+        if (reap_child_status_poll(p, "tftp_server", rmsg, sizeof(rmsg), 2000)) {
+            LOGI("radio", "%s", rmsg);
+            plog_append(rmsg);
+        } else if (!proc_running("tftp_server")) {
+            LOGI("radio", "%s", "tftp_server: died early (status unknown)");
+            plog_append("tftp_server: died early (status unknown)");
+        }
+    }
 }
 
 /* Both daemons above used to only start deep inside boot_modem(), which
@@ -244,8 +289,11 @@ static void start_tftp_server(void)
  * again later from boot_modem() — safe, cheap, not removed there. */
 void start_rmtfs_daemons_early(void)
 {
+    radio_trace("start_rmtfs_daemons_early");
     start_rmt_storage();
     start_tftp_server();
+    plog_append(proc_running("rmt_storage") ?
+                "rmtfs: rmt_storage alive" : "rmtfs: rmt_storage not running");
 }
 
 /* Real identity per init.qcom.rc: `service ssgqmigd ... class late_start
@@ -439,32 +487,97 @@ static void start_qcrild_probe(void)
     LOGI("radio", "qcrild: start pid=%d (user radio)", (int)p);
 }
 
+
+static void modem_state_watch_start(void)
+{
+    pid_t p = fork();
+
+    if (p != 0)
+        return;
+    for (int i = 0; i < 25; i++) {
+        char st[32], line[160];
+
+        if (read_subsys_state("subsys0", st, sizeof(st)) != 0)
+            snprintf(st, sizeof(st), "?");
+        snprintf(line, sizeof(line),
+                 "modem_watch +%ds state=%s qrtr=%d pdmap=%d rmt=%d cnss=%d wlfw=%d",
+                 i * 2, st,
+                 proc_running("qrtr-ns"), proc_running("pd-mapper"),
+                 proc_running("rmt_storage"), proc_running("cnss-daemon"),
+                 qrtr_has_wlfw());
+        plog_append(line);
+        sleep(2);
+    }
+    _exit(0);
+}
+
+
+static void modem_try_ssr_reset(void)
+{
+    const char *ssr = "/sys/kernel/boot_adsp/ssr";
+
+    if (access(ssr, W_OK) != 0)
+        return;
+    LOGI("radio", "%s", "modem: boot_adsp SSR reset");
+    plog_append("modem: boot_adsp SSR reset");
+    wf_boot(ssr);
+    usleep(2000000);
+}
+
+
+void radio_modem_recover_stuck(void)
+{
+    char st[32] = "?";
+
+    if (read_subsys_state("subsys0", st, sizeof(st)) != 0)
+        return;
+    /* SUBSYS_OFFLINING=0 is the kzalloc default in subsystem_restart.c —
+     * not proof of a stuck shutdown.  boot_adsp SSR before the first
+     * subsystem_get("modem") is a no-op (pil_h NULL → -EINVAL). */
+    LOGI("radio", "%s %s", "modem recover boot", st);
+    plog_append("modem-recover: boot state (informational only)");
+    plog_append(st);
+}
+
+
 void boot_modem(void)
 {
     const char *direct = "/sys/kernel/boot_modem/boot";
     char st[32] = "?";
-    int rc;
 
+    radio_trace("boot_modem: enter");
+    plog_append("boot_modem: begin");
+    ensure_rmtfs_firmware_paths();
     try_load_modem_ko();
+
+    if (ensure_modem_pil_firmware() != 0) {
+        LOGI("radio", "%s", "modem: PIL firmware incomplete — continuing anyway");
+        plog_append("modem: PIL firmware incomplete — continuing");
+    }
 
     read_subsys_state("subsys0", st, sizeof(st));
     LOGI("radio", "%s %s", "modem before", st);
+    {
+        char line[64];
+        snprintf(line, sizeof(line), "modem before state=%s", st);
+        plog_append(line);
+    }
     if (!strcmp(st, "ONLINE")) {
         LOGI("radio", "%s", "modem: already ONLINE");
         return;
     }
     if (!strcmp(st, "OFFLINING")) {
-        rc = wait_modem_leave_offlining(st, sizeof(st), 15);
-        if (rc == 2) {
-            LOGI("radio", "%s", "modem: ONLINE after offlining wait");
-            return;
-        }
-        LOGI("radio", "%s %s", "modem: boot during", st);
+        /* enum value 0 before first subsystem_get — usually uninitialized,
+         * not an active shutdown in subsys_stop().  Do not wait 30s. */
+        LOGI("radio", "%s", "modem: OFFLINING (default) — booting");
+        plog_append("modem: OFFLINING likely uninitialized — booting");
     }
 
     link_modem_pil_firmware();
-    if (!path_exists("/lib/firmware/modem.mdt"))
-        LOGI("radio", "%s", "modem: /lib/firmware/modem.mdt missing");
+    if (ensure_modem_pil_firmware() != 0) {
+        LOGI("radio", "%s", "modem: PIL fw missing after link");
+        plog_append("modem: PIL fw missing after link");
+    }
 
     start_rmt_storage();
     start_tftp_server();
@@ -477,13 +590,19 @@ void boot_modem(void)
     if (access(direct, W_OK) == 0) {
         wf(direct, "1");
         LOGI("radio", "%s", "modem: boot_modem sysfs");
+        plog_append("modem: boot_modem sysfs=1");
     } else if (access("/sys/kernel/boot_adsp/boot", W_OK) == 0) {
         wf_boot("/sys/kernel/boot_adsp/boot");
         LOGI("radio", "%s %s", "modem: boot via adsp-loader", st);
+        plog_append("modem: boot via boot_adsp");
     } else {
         LOGI("radio", "%s", "modem: no boot interface");
+        plog_append("modem: no boot interface");
         return;
     }
+
+    modem_state_watch_start();
+    radio_dump_qrtr("boot_modem PIL triggered");
 
     /* Log kernel-side status if available */
     {
@@ -502,8 +621,29 @@ void boot_modem(void)
         }
     }
 
-    usleep(2000000);
-    run_sh("dmesg 2>/dev/null | grep -iE 'pil|PIL|subsys|modem|mpss|q6|minios_modem' >> /tmp/radio.log");
+    /* Real-ROM reference capture (MEMORY.md, this same session): modem
+     * reset -> WLAN FW ready takes ~4s total on real Android, and the
+     * modem's own internal bailout panics the whole SoC exactly 40.05s
+     * after "Brought out of reset" if AP-side WLAN bring-up hasn't
+     * happened yet (§4.5aq). This function used to block its caller here
+     * for a flat 18s just to grab a late PIL dmesg snapshot for /tmp/
+     * radio.log -- a live pstore capture this session showed that alone
+     * pushes RF power-on (in wlan.c, after this function returns) to
+     * ~38s post-reset, leaving only ~2s of margin before the 40s bailout
+     * every single boot, independent of wlan.c's own settle-wait tuning.
+     * Do the same dmesg snapshot in a forked child instead so it doesn't
+     * eat any of that budget -- purely diagnostic, nothing downstream
+     * depends on it having completed before boot_modem() returns. */
+    {
+        pid_t p = fork();
+        if (p == 0) {
+            usleep(18000000);
+            run_sh("dmesg 2>/dev/null | grep -iE 'pil|PIL|subsys|modem|mpss|q6|minios_modem' >> /tmp/radio.log");
+            _exit(0);
+        }
+    }
+    plog_append("boot_modem: dmesg PIL snapshot scheduled (async, +18s, non-blocking)");
+    plog_save_tmp_logs();
 }
 
 

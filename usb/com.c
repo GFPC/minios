@@ -185,7 +185,7 @@ int com_handle(int out, const char *line)
     if (!strcmp(line, "ping"))
         return write(out, "pong\r\n", 6), 1;
     if (!strcmp(line, "help")) {
-        const char *h = "commands: ping help status usb net drm dmesg dmesg-find kms touch touchmon adb adb-tcp adb-on usb-adb com-on ffslog fb radio wifi bt wifi-scan scan-result radio-log cnss-log crash-log qrtr-log pd-log icnss-state binder-state catlog qrtr-lookup radio-diag radio-pid radio-ls wifi-fw metrics save-log sync bt-attach modem-state boot-count pstore poweroff reboot recovery mount-debugfs\r\n";
+        const char *h = "commands: ping help status usb net drm dmesg dmesg-find kms touch touchmon adb adb-tcp adb-on usb-adb com-on ffslog fb radio wifi bt wifi-scan scan-result radio-log cnss-log crash-log qrtr-log pd-log icnss-state binder-state catlog qrtr-lookup radio-diag radio-pid qrtr-pid radio-ls wifi-fw metrics save-log sync clean-logs bt-attach modem-state boot-count pstore poweroff reboot recovery mount-debugfs\r\n";
         write(out, h, strlen(h));
         return 1;
     }
@@ -686,6 +686,13 @@ int com_handle(int out, const char *line)
             write(out, b, (size_t)n);
         return 1;
     }
+    if (!strcmp(line, "qrtr-pid")) {
+        char b[2048];
+        int n = radio_format_qrtr_pidinfo(b, sizeof(b));
+        if (n > 0)
+            write(out, b, (size_t)n);
+        return 1;
+    }
     if (!strcmp(line, "wifi-fw")) {
         char b[2048];
         int n = radio_format_fw_list(b, sizeof(b));
@@ -762,6 +769,29 @@ int com_handle(int out, const char *line)
         plog_save_tmp_logs();
         sync();
         write(out, "synced — safe to remove SD now\r\n", 33);
+        return 1;
+    }
+    /* pd-mapper.log/qrtr-ns.log/radio.log are the small, actively-written
+     * per-daemon logs -- repeatedly observed corrupted/unreadable on the SD
+     * card right after a crash that happened mid-write (unlike boot.log/
+     * qmi_trace.log, which fsync per line and survive). Remove and recreate
+     * them fresh rather than trying to salvage a truncated file. */
+    if (!strcmp(line, "clean-logs")) {
+        static const char *victims[] = {
+            "/mnt/sdcard/minios/pd-mapper.log",
+            "/mnt/sdcard/minios/qrtr-ns.log",
+            "/mnt/sdcard/minios/radio.log",
+            NULL
+        };
+        int n = 0;
+        for (int i = 0; victims[i]; i++) {
+            if (unlink(victims[i]) == 0)
+                n++;
+        }
+        sync();
+        char b[64];
+        int m = snprintf(b, sizeof(b), "removed %d log file(s)\r\n", n);
+        write(out, b, (size_t)m);
         return 1;
     }
     if (!strcmp(line, "boot-count")) {

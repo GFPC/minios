@@ -1,6 +1,7 @@
 #include <sys/sysmacros.h>
 #define _GNU_SOURCE
 #include "cnss.h"
+#include "firmware.h"
 #include "radio.h"
 #include "radio_state.h"
 #include "radio_utils.h"
@@ -19,6 +20,8 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <sys/mount.h>
+#include <sys/prctl.h>
+#include <grp.h>
 #include <sys/ioctl.h>
 #include <net/if.h>
 #include <sys/un.h>
@@ -30,7 +33,7 @@ extern char **environ;
 extern int system_mounted, vendor_mounted;
 extern pid_t cnss_qrtr_pid, cnss_pdmap_pid, cnss_daemon_pid;
 #define CNSS_EXEC_LOG "/tmp/cnss.exec.log"
-#define CNSS_BUILD_TAG "cnss-start v36 no-rproc"
+#define CNSS_BUILD_TAG "cnss-start v43-boot_modem-late"
 void ensure_cnss_devnodes(void)
 {
     char buf[32];
@@ -55,6 +58,26 @@ void ensure_cnss_devnodes(void)
     LOGI("radio", "%s", "cnss: /dev/diag created");
 }
 
+
+/* cnss_qrtr_pid is a plain global — fine within one process, but
+ * radio_work() (and everything it calls, including this file's own
+ * start_cnss_stack()) runs inside a fork()ed child (start_job()). Writes to
+ * the global there live in that child's own copy-on-write memory and are
+ * invisible to the top-level init process that actually serves COM/qrtr-pid
+ * — which keeps reporting whatever cnss_qrtr_pid held in ITS OWN address
+ * space (always the earliest, pre-fork spawn, never the later one started
+ * during an actual `radio` run). Persist the real PID to a file instead,
+ * which any process can read regardless of which fork wrote it. */
+void write_qrtr_pid_file(pid_t pid)
+{
+    char buf[16];
+    int n = snprintf(buf, sizeof(buf), "%d\n", (int)pid);
+    int fd = open("/tmp/qrtr_ns.pid", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        write(fd, buf, (size_t)n);
+        close(fd);
+    }
+}
 
 void cnss_log_exit(pid_t pid)
 {
@@ -86,33 +109,137 @@ void cnss_log_exit(pid_t pid)
 
 void cnss_log_line(const char *msg)
 {
-    int fd = open(CNSS_EXEC_LOG, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    /* Shared across multiple daemons that each drop to a different uid
+     * (qrtr-ns=2906, pd-mapper/cnss-daemon=1000) -- O_CREAT's mode is
+     * masked by the creating process's umask, so requesting 0666 here
+     * isn't enough by itself (a default 022 umask silently turns it back
+     * into 0644, and the next daemon's non-root write fails again). Force
+     * it with an explicit fchmod so umask can't undo it. */
+    int fd = open(CNSS_EXEC_LOG, O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (fd >= 0) {
+        fchmod(fd, 0666);
         dprintf(fd, "%s\n", msg);
         close(fd);
     }
 }
 
 
-void cnss_drop_to_system(void)
+/* setcap()-ing a capability into effective/permitted only sticks past a
+ * following setuid() to a non-root uid if PR_SET_KEEPCAPS was set first,
+ * and even then the kernel only *keeps* it in the permitted set across
+ * setuid() -- it still has to be re-raised into effective with a second
+ * capset() call afterward. The capset()-before-setuid() sequence this
+ * replaced looked like it granted CAP_NET_ADMIN across the privilege drop
+ * but actually didn't: the capability was silently wiped the moment
+ * setuid() ran, with nothing to reveal that either. */
+static void cnss_raise_cap(unsigned cap, const char *label)
 {
-    struct __user_cap_header_struct hdr = {
-        .version = _LINUX_CAPABILITY_VERSION_3,
-        .pid = 0,
-    };
+    struct __user_cap_header_struct hdr = { _LINUX_CAPABILITY_VERSION_3, 0 };
     struct __user_cap_data_struct data[2];
+    char msg[96];
 
     memset(data, 0, sizeof(data));
-    data[0].effective = data[0].permitted = data[0].inheritable = (1U << CAP_NET_ADMIN);
-    if (syscall(SYS_capset, &hdr, data) != 0)
-        cnss_log_line("capset NET_ADMIN failed (ok as root)");
-    /* No /etc/group in initramfs — setuid(1000) usually fails; stay root. */
-    if (setgroups(0, NULL) == 0 && setgid(1000) == 0 && setuid(1000) == 0) {
-        char msg[64];
-        snprintf(msg, sizeof(msg), "dropped uid=%d gid=%d", getuid(), getgid());
+    data[0].effective = data[0].permitted = data[0].inheritable = (1U << cap);
+    if (syscall(SYS_capset, &hdr, data) != 0) {
+        snprintf(msg, sizeof(msg), "%s: capset failed errno=%d (%s)", label, errno, strerror(errno));
         cnss_log_line(msg);
-    } else
-        cnss_log_line("stay root (no /etc/group)");
+    }
+}
+
+/* Drop from root to (uid, gid, supplementary groups), matching this
+ * daemon's real identity on a stock ROM (see KERNEL_CHANGES.md / the
+ * structure-audit that found these running as root the whole time despite
+ * init.qcom.rc/init.target.rc specifying otherwise). Every failure logs its
+ * own errno instead of the old bare "stay root" -- if this doesn't work,
+ * the log says exactly why. */
+void cnss_drop_privileges(uid_t uid, gid_t gid, const gid_t *groups, int ngroups,
+                           unsigned keep_cap, const char *label)
+{
+    char msg[128];
+
+    snprintf(msg, sizeof(msg), "%s: drop_privileges entered, target uid=%u gid=%u ngroups=%d",
+             label, uid, gid, ngroups);
+    cnss_log_line(msg);
+
+    if (prctl(PR_SET_KEEPCAPS, 1) != 0)
+        cnss_log_line("prctl(KEEPCAPS) failed (ok as root)");
+
+    if (setgroups(ngroups, groups) != 0) {
+        snprintf(msg, sizeof(msg), "%s: setgroups failed errno=%d (%s)", label, errno, strerror(errno));
+        cnss_log_line(msg);
+        return;
+    }
+    if (setgid(gid) != 0) {
+        snprintf(msg, sizeof(msg), "%s: setgid(%u) failed errno=%d (%s)", label, gid, errno, strerror(errno));
+        cnss_log_line(msg);
+        return;
+    }
+    if (setuid(uid) != 0) {
+        snprintf(msg, sizeof(msg), "%s: setuid(%u) failed errno=%d (%s)", label, uid, errno, strerror(errno));
+        cnss_log_line(msg);
+        return;
+    }
+    if (keep_cap)
+        cnss_raise_cap(keep_cap, label);
+
+    snprintf(msg, sizeof(msg), "%s: dropped uid=%d gid=%d", label, getuid(), getgid());
+    cnss_log_line(msg);
+}
+
+void cnss_drop_to_system(void)
+{
+    static const gid_t groups[] = { 1000, 3003, 3005, 3009 }; /* system, inet, net_admin, wifi */
+    cnss_drop_privileges(1000, 1000, groups, 4, CAP_NET_ADMIN, "cnss-daemon");
+}
+
+/* Real ROM identities from init.qcom.rc/init.target.rc (uid confirmed via
+ * stock_miui/vendor_tree/etc/passwd: vendor_qrtr=2906).
+ *
+ * keep_cap=0: binding QRTR_PORT_CTRL doesn't need CAP_NET_BIND_SERVICE at
+ * all (kernel/net/qrtr/qrtr.c's qrtr_port_assign() allows it via
+ * in_egroup_p(AID_VENDOR_QRTR), gid=2906, independent of any capability).
+ * NOTE: an earlier version of this comment blamed the capability for a
+ * secureexec/AT_SECURE bionic-linker crash — WRONG, disproven live: with
+ * keep_cap=0 here the crash (SIGSEGV inside linker64 itself, NULL+0xa0,
+ * translation fault) still happened, identically, on both the kernel's own
+ * PT_INTERP-resolved linker64 and our own explicit /lib64/linker64
+ * (exec_via_linker64()) — so it's not about which capability or which
+ * linker binary. pd-mapper (cnss_drop_to_pd_mapper(), also keep_cap=0)
+ * crashes the exact same way. The one remaining difference from
+ * cnss_drop_to_system() (which does NOT crash) is groups: cnss-daemon gets
+ * a real 4-entry supplementary group list, qrtr-ns/pd-mapper got
+ * setgroups(0, NULL) — an empty list, unlike what Android's own init
+ * actually does for a `user X group X` service (its initgroups()-equivalent
+ * still includes the user's own gid as a supplementary entry, never truly
+ * zero groups). Passing the daemon's own gid as its one supplementary group
+ * here to match that and test the correlation directly. */
+void cnss_drop_to_vendor_qrtr(void)
+{
+    static const gid_t groups[] = { 2906 };
+    cnss_drop_privileges(2906, 2906, groups, 1, 0, "qrtr-ns");
+}
+
+void cnss_drop_to_pd_mapper(void)
+{
+    /* See cnss_drop_to_vendor_qrtr()'s comment — same empty-groups vs
+     * linker64-SIGSEGV correlation, same test. */
+    static const gid_t groups[] = { 1000 };
+    cnss_drop_privileges(1000, 1000, groups, 1, 0, "pd-mapper");
+}
+
+/* Real logd is what pd-mapper/cnss-daemon's liblog actually talks to; see
+ * minios/firmware/adb/logd_stub.c for why nothing else was ever there.
+ * Must be up before those daemons exec (they connect on first log call and
+ * never retry), so callers start this first. */
+void start_logd_stub(void)
+{
+    static const char *path = "/sbin/logd_stub";
+    char *argv[] = { (char *)"logd_stub", NULL };
+
+    if (proc_running("logd_stub") || !path_exists(path))
+        return;
+    if (start_vendor_daemon(path, argv) > 0)
+        LOGI("radio", "%s", "logd_stub started");
 }
 
 
@@ -200,8 +327,9 @@ void cnss_child_setup(const char *run)
             dup2(fd, 0);
             close(fd);
         }
-        fd = open(CNSS_EXEC_LOG, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        fd = open(CNSS_EXEC_LOG, O_WRONLY | O_CREAT | O_APPEND, 0666);
         if (fd >= 0) {
+            fchmod(fd, 0666);
             dprintf(fd, "--- child pid=%d run=%s ---\n", getpid(), run);
             dup2(fd, 1);
             dup2(fd, 2);
@@ -219,6 +347,7 @@ void cnss_child_setup(const char *run)
     set_daemon_preload();
     ensure_linker64_real();
     ensure_etc_group();
+    ensure_etc_passwd();
     cnss_drop_to_system();
 }
 
@@ -312,10 +441,11 @@ void daemon_child_setup(const char *path, const char *logfile)
     set_daemon_preload();
     ensure_linker64_real();
     ensure_etc_group();
+    ensure_etc_passwd();
 }
 
 
-pid_t start_vendor_daemon(const char *path, char *const argv[])
+static pid_t start_vendor_daemon_impl(const char *path, char *const argv[], void (*drop)(void))
 {
     pid_t p;
     char logfile[128];
@@ -333,8 +463,25 @@ pid_t start_vendor_daemon(const char *path, char *const argv[])
         return p > 0 ? p : 0;
 
     daemon_child_setup(path, logfile);
-    execv(path, argv);
+    if (drop)
+        drop();
+    /* exec_via_linker64() first, not as a fallback: plain execv() resolves
+     * PT_INTERP straight out of the ELF header, which on this device is
+     * "/system/bin/linker64" — a path on a read-only partition that's often
+     * not a real file at all here (see ensure_linker64_real()'s own comment,
+     * firmware.c). The failure mode isn't execv() returning an error (which
+     * WOULD fall through to the code below) — the kernel still finds *some*
+     * inode there and "successfully" execs it as the interpreter, which
+     * then itself crashes immediately (observed: qrtr-ns and pd-mapper both
+     * segfaulting inside linker64 at the same offset, right after setuid,
+     * before either binary's own code ever runs). Since execv() never
+     * returns on that kind of "successful" wrong-interpreter load, the old
+     * execv()-then-exec_via_linker64() order could never actually reach the
+     * fallback in exactly the case it exists for. Try our own known-good
+     * /lib64/linker64 explicitly first; only fall back to plain execv() if
+     * that's unavailable. */
     exec_via_linker64(path, argv);
+    execv(path, argv);
     {
         char msg[192];
         snprintf(msg, sizeof(msg), "exec fail %s errno=%d (%s)", path, errno, strerror(errno));
@@ -345,12 +492,51 @@ pid_t start_vendor_daemon(const char *path, char *const argv[])
     _exit(127);
 }
 
+pid_t start_vendor_daemon(const char *path, char *const argv[])
+{
+    return start_vendor_daemon_impl(path, argv, NULL);
+}
+
+pid_t start_vendor_daemon_dropped(const char *path, char *const argv[], void (*drop)(void))
+{
+    return start_vendor_daemon_impl(path, argv, drop);
+}
+
 
 void run_vendor_oneshot(const char *path, char *const argv[])
 {
+    run_vendor_oneshot_timeout(path, argv, 0);
+}
+
+int run_vendor_oneshot_timeout(const char *path, char *const argv[], int timeout_sec)
+{
     pid_t p = start_vendor_daemon(path, argv);
-    if (p > 0)
+    char line[160];
+    int st;
+
+    if (p <= 0)
+        return -1;
+    if (timeout_sec <= 0) {
         waitpid(p, NULL, 0);
+        return 0;
+    }
+    for (int i = 0; i < timeout_sec * 10; i++) {
+        pid_t w = waitpid(p, &st, WNOHANG);
+        if (w == p)
+            return 0;
+        if (w < 0 && errno == ECHILD)
+            return 0;
+        wdt_pet();
+        usleep(100000);
+    }
+    kill(p, SIGKILL);
+    waitpid(p, NULL, 0);
+    snprintf(line, sizeof(line),
+             "cnss: oneshot timeout %ds pid=%d cmd=%s — killed",
+             timeout_sec, (int)p, path);
+    plog_append(line);
+    LOGI("radio", "%s", line);
+    return 1;
 }
 
 
@@ -451,6 +637,20 @@ void stage_cnss_libs(void)
     };
     static int staged = 0;
 
+    /* BUG FIXED (MEMORY.md §4.5b1): this function is called twice per boot
+     * — once very early (main.c's unconditional modem_qmi_services_start(),
+     * long before /system is ever mounted) and again later from
+     * start_cnss_stack() (after radio_prepare()/mount_radio_partitions()
+     * has mounted /system). The old `staged = 1` at the end of this
+     * function was set unconditionally, including on the early call where
+     * `system_mounted` is always false and the whole force-refresh loop
+     * below is a no-op — poisoning this cache so the *real* refresh (once
+     * /system actually becomes available) never runs for the rest of that
+     * boot. Confirmed live: this exact regression reproduced the original
+     * historical bug (§4.3 #5) byte-for-byte — vndservicemanager exiting
+     * with the same stale-libc++.so linker error — even though the
+     * force-refresh code itself was never removed. Only treat staging as
+     * "done" once it actually had a mounted /system to copy from. */
     if (staged && path_exists("/lib64/libvndksupport.so")) {
         LOGI("radio", "%s", "cnss libs: cached");
         return;
@@ -523,7 +723,12 @@ void stage_cnss_libs(void)
         symlink_force("/vendor/lib64/libqrtr.so", "/lib64/libqrtr.so");
     else if (path_exists("/mnt/vendor/lib64/libqrtr.so"))
         symlink_force("/mnt/vendor/lib64/libqrtr.so", "/lib64/libqrtr.so");
-    staged = 1;
+    if (system_mounted) {
+        staged = 1;
+        plog_append("cnss libs: staged from mounted /system");
+    } else {
+        plog_append("cnss libs: /system not mounted yet, not caching (will retry)");
+    }
     LOGI("radio", "%s", path_exists("/lib64/libvndksupport.so") ?
          "cnss libs: vndksupport ok" : "cnss libs: vndksupport missing");
 }
@@ -744,6 +949,7 @@ void ensure_cnss_sockets(void)
 {
     md("/dev/socket");
     chmod("/dev/socket", 0777);
+    md("/dev/socket/netmgr");
 
     if (access("/dev/socket/wpa_wlan0", F_OK) == 0)
         return;
@@ -761,6 +967,34 @@ void ensure_cnss_sockets(void)
         LOGI("radio", "%s", "cnss: wpa_wlan0 socket ok");
     }
     close(fd);
+}
+
+
+static void start_netmgrd(void)
+{
+    const char *bin;
+
+    if (proc_running("netmgrd")) {
+        plog_append("cnss: netmgrd already running");
+        return;
+    }
+    md("/data/vendor/netmgr/recovery");
+    bin = stage_vendor_bin("netmgrd");
+    if (!bin) {
+        plog_append("cnss: netmgrd not found, skipping");
+        return;
+    }
+    {
+        char *argv[] = { (char *)"netmgrd", NULL };
+        pid_t p = start_vendor_daemon(bin, argv);
+        char line[80];
+        snprintf(line, sizeof(line), "cnss: netmgrd start pid=%d", (int)p);
+        plog_append(line);
+        usleep(400000);
+        snprintf(line, sizeof(line), "cnss: netmgrd alive=%d",
+                 proc_running("netmgrd"));
+        plog_append(line);
+    }
 }
 
 
@@ -789,28 +1023,49 @@ void start_modem_qmi_services(void)
     start_binder_services();
     usleep(300000);
     ensure_cnss_sockets();
+    start_logd_stub();
 
     qrtr = stage_vendor_bin("qrtr-ns");
     if (qrtr && !proc_running("qrtr-ns")) {
         char *argv[] = { (char *)"qrtr-ns", (char *)"-f", NULL };
-        cnss_qrtr_pid = start_vendor_daemon(qrtr, argv);
+        cnss_qrtr_pid = start_vendor_daemon_dropped(qrtr, argv, cnss_drop_to_vendor_qrtr);
         if (cnss_qrtr_pid > 0) {
-            LOGI("radio", "%s", "modem qmi: qrtr-ns started");
-            usleep(400000);
+            write_qrtr_pid_file(cnss_qrtr_pid);
+            {
+                char smsg[64];
+                snprintf(smsg, sizeof(smsg), "modem qmi: qrtr-ns started pid=%d", (int)cnss_qrtr_pid);
+                LOGI("radio", "%s", smsg);
+                plog_append(smsg);
+            }
+            {
+                char rmsg[128];
+                if (reap_child_status_poll(cnss_qrtr_pid, "modem qmi: qrtr-ns", rmsg,
+                                           sizeof(rmsg), 5000)) {
+                    LOGI("radio", "%s", rmsg);
+                    plog_append(rmsg);
+                    cnss_log_line(rmsg);
+                } else if (!proc_running("qrtr-ns")) {
+                    LOGI("radio", "%s", "modem qmi: qrtr-ns died early (status unknown)");
+                    plog_append("modem qmi: qrtr-ns died early (status unknown)");
+                    cnss_log_line("modem qmi: qrtr-ns died early (status unknown)");
+                }
+            }
         }
     }
 
     irsc = stage_vendor_bin("irsc_util");
     if (irsc && path_exists("/vendor/etc/sec_config")) {
         char *argv[] = { (char *)"irsc_util", (char *)"/vendor/etc/sec_config", NULL };
-        run_vendor_oneshot(irsc, argv);
+        plog_append("modem qmi: irsc_util start (5s cap)");
+        run_vendor_oneshot_timeout(irsc, argv, 5);
+        plog_append("modem qmi: irsc_util done");
     }
     usleep(200000);
 
     pdmap = stage_vendor_bin("pd-mapper");
     if (pdmap && !proc_running("pd-mapper")) {
         char *argv[] = { (char *)"pd-mapper", NULL };
-        cnss_pdmap_pid = start_vendor_daemon(pdmap, argv);
+        cnss_pdmap_pid = start_vendor_daemon_dropped(pdmap, argv, cnss_drop_to_pd_mapper);
         if (cnss_pdmap_pid > 0) {
             LOGI("radio", "%s", "modem qmi: pd-mapper started");
             usleep(400000);
@@ -849,6 +1104,7 @@ void start_cnss_stack(void)
     usleep(500000);
     ensure_cnss_sockets();
     ensure_debugfs();
+    start_logd_stub();
 
     /* adsprpcd and perfd skipped — booting ADSP/compute DSPs without full
      * vendor services causes subsystem SSR with SYSRESET level on SM6125. */
@@ -858,22 +1114,36 @@ void start_cnss_stack(void)
         LOGI("radio", "%s", "cnss: qrtr-ns missing");
     else if (!proc_running("qrtr-ns")) {
         char *argv[] = { (char *)"qrtr-ns", (char *)"-f", NULL };
-        cnss_qrtr_pid = start_vendor_daemon(qrtr, argv);
+        cnss_qrtr_pid = start_vendor_daemon_dropped(qrtr, argv, cnss_drop_to_vendor_qrtr);
         if (cnss_qrtr_pid > 0) {
-            LOGI("radio", "%s", "cnss: qrtr-ns started");
-            usleep(500000);
-            if (!proc_running("qrtr-ns"))
-                LOGI("radio", "%s", "cnss: qrtr-ns died early");
+            write_qrtr_pid_file(cnss_qrtr_pid);
+            {
+                char smsg[64];
+                snprintf(smsg, sizeof(smsg), "cnss: qrtr-ns started pid=%d", (int)cnss_qrtr_pid);
+                LOGI("radio", "%s", smsg);
+                plog_append(smsg);
+            }
+            {
+                char rmsg[128];
+                if (reap_child_status_poll(cnss_qrtr_pid, "cnss: qrtr-ns", rmsg,
+                                           sizeof(rmsg), 5000)) {
+                    LOGI("radio", "%s", rmsg);
+                    plog_append(rmsg);
+                    cnss_log_line(rmsg);
+                } else if (!proc_running("qrtr-ns")) {
+                    LOGI("radio", "%s", "cnss: qrtr-ns died early (status unknown)");
+                    plog_append("cnss: qrtr-ns died early (status unknown)");
+                    cnss_log_line("cnss: qrtr-ns died early (status unknown)");
+                }
+            }
         }
     }
     usleep(400000);
 
-    irsc = stage_vendor_bin("irsc_util");
-    if (irsc && path_exists("/vendor/etc/sec_config")) {
-        char *argv[] = { (char *)"irsc_util", (char *)"/vendor/etc/sec_config", NULL };
-        run_vendor_oneshot(irsc, argv);
-        LOGI("radio", "%s", "cnss: irsc_util done");
-    }
+    /* irsc_util runs once at early boot (start_modem_qmi_services) with a 5s
+     * cap — it can block forever on QMI when modem is OFFLINING. Do not repeat
+     * here before boot_modem(); post-PIL retry is below after boot_modem(). */
+    plog_append("cnss: irsc_util skipped pre-boot_modem (early boot)");
     usleep(200000);
 
     pdmap = stage_vendor_bin("pd-mapper");
@@ -881,15 +1151,19 @@ void start_cnss_stack(void)
         LOGI("radio", "%s", "cnss: pd-mapper missing");
     else if (!proc_running("pd-mapper")) {
         char *argv[] = { (char *)"pd-mapper", NULL };
-        cnss_pdmap_pid = start_vendor_daemon(pdmap, argv);
+        cnss_pdmap_pid = start_vendor_daemon_dropped(pdmap, argv, cnss_drop_to_pd_mapper);
         if (cnss_pdmap_pid > 0) {
             LOGI("radio", "%s", "cnss: pd-mapper started");
+            plog_append("cnss: pd-mapper started");
             usleep(500000);
             if (!proc_running("pd-mapper"))
                 LOGI("radio", "%s", "cnss: pd-mapper died early");
         }
     }
     usleep(400000);
+
+    start_netmgrd();
+    usleep(200000);
 
     /* EXPERIMENTAL (see MEMORY.md §4.5): on a real working LineageOS boot on
      * this exact hardware, `pm-service` (Qualcomm Peripheral Manager,
@@ -975,17 +1249,30 @@ void start_cnss_stack(void)
         }
     }
 
-    /* Reordered per MEMORY.md live-ROM trace: the real ROM has cnss-daemon
-     * (and its wlfw QMI listener) already up ~1s after qrtr-ns starts,
-     * BEFORE the modem is even brought out of reset — nothing on the real
-     * system waits for modem readiness before starting cnss-daemon. This
-     * used to call boot_modem() before qrtr-ns/pd-mapper/cnss-daemon even
-     * started, burning a chunk of the WLAN firmware's internal ~40s
-     * handshake window before anything was listening. Trigger the modem
-     * PIL boot last instead, once the whole QMI listener chain is already
-     * up and ready to react the instant the WLAN co-processor announces
-     * itself. */
+    /* boot_modem() runs HERE — after qrtr-ns/pd-mapper/pm-service/cnss-daemon
+     * are all confirmed up — matching the one ordering this project has ever
+     * captured a real "Brought out of reset" + full PIL trace with (see
+     * project MEMORY.md §4.5v/§4.5aq: reordering to call boot_modem() last
+     * produced a confirmed subsystem_get(modem)->Brought out of reset->QRTR
+     * handshake sequence in a captured kernel panic trace; calling it earlier,
+     * before cnss-daemon, is the one thing this project has direct evidence
+     * against — do not move this earlier without re-reading that history). */
+    ensure_rmtfs_firmware_paths();
+    plog_append("cnss: boot_modem (post-cnss-daemon, matches MEMORY.md #4.5v/aq)");
+    radio_trace("cnss: boot_modem now");
     boot_modem();
+    radio_dump_qrtr("post boot_modem");
+    usleep(500000);
+
+    irsc = stage_vendor_bin("irsc_util");
+    if (irsc && path_exists("/vendor/etc/sec_config")) {
+        char *argv[] = { (char *)"irsc_util", (char *)"/vendor/etc/sec_config", NULL };
+        plog_append("cnss: irsc_util post-boot_modem (5s cap)");
+        run_vendor_oneshot_timeout(irsc, argv, 5);
+        plog_append("cnss: irsc_util post-boot_modem done");
+    }
+
+    plog_append("cnss: stack up (boot_modem triggered late, post-cnss-daemon)");
 }
 
 

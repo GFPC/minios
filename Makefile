@@ -22,7 +22,7 @@ INIT_SRCS := \
 
 UI_SRCS := ui/kms_paint.c ui/minui.c ui/touch.c ui/ui.c
 
-.PHONY: all init kms_paint wlan_scan ffs_adb propstub cnss_shim drm_dump qrtr_lookup clean
+.PHONY: all init kms_paint wlan_scan ffs_adb propstub cnss_shim logd_stub drm_dump qrtr_lookup clean
 
 all: init kms_paint
 
@@ -61,6 +61,11 @@ $(OUT)/libcnss_shim.so: firmware/adb/cnss_shim.c | $(OUT)
 	$(CC) -shared -fPIC -Os -nostdlib -Wl,-soname,libcnss_shim.so \
 		-o $@ $<
 
+logd_stub: $(OUT)/logd_stub
+
+$(OUT)/logd_stub: firmware/adb/logd_stub.c | $(OUT)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
+
 drm_dump: $(OUT)/drm_dump
 
 $(OUT)/drm_dump: tools/drm_dump.c | $(OUT)
@@ -72,4 +77,4 @@ $(OUT)/qrtr_lookup: tools/qrtr_lookup.c | $(OUT)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 
 clean:
-	rm -f $(INIT_BIN) $(KMS_BIN) $(WLAN_BIN) $(OUT)/ffs_adb $(OUT)/propstub.so $(OUT)/libcnss_shim.so $(OUT)/drm_dump $(OUT)/qrtr_lookup
+	rm -f $(INIT_BIN) $(KMS_BIN) $(WLAN_BIN) $(OUT)/ffs_adb $(OUT)/propstub.so $(OUT)/libcnss_shim.so $(OUT)/logd_stub $(OUT)/drm_dump $(OUT)/qrtr_lookup

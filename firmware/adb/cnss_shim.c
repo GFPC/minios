@@ -169,6 +169,7 @@ void __libcpp_verbose_abort(const char *fmt, ...)
 #define __NR_openat     56
 #define __NR_close      57
 #define __NR_fsync      82
+#define __NR_fchmod     52
 #define __NR_getpid     172
 #define __NR_socket     198
 #define __NR_sendto     206
@@ -289,8 +290,9 @@ static void shim_log_qmi(const char *dir, int fd, const unsigned char *buf, long
 
     fdlog = (int)shim_syscall6(__NR_openat, AT_FDCWD_V,
                                 (long)"/mnt/sdcard/minios/qmi_trace.log",
-                                O_WRONLY_V | O_CREAT_V | O_APPEND_V, 0644, 0, 0);
+                                O_WRONLY_V | O_CREAT_V | O_APPEND_V, 0666, 0, 0);
     if (fdlog >= 0) {
+        shim_syscall6(__NR_fchmod, fdlog, 0666, 0, 0, 0, 0);
         shim_syscall6(__NR_write, fdlog, (long)line, p, 0, 0, 0);
         shim_syscall6(__NR_fsync, fdlog, 0, 0, 0, 0, 0);
         shim_syscall6(__NR_close, fdlog, 0, 0, 0, 0, 0);
@@ -335,8 +337,9 @@ static void shim_ctor_log(void)
 
     fdlog = (int)shim_syscall6(__NR_openat, AT_FDCWD_V,
                                 (long)"/mnt/sdcard/minios/qmi_trace.log",
-                                O_WRONLY_V | O_CREAT_V | O_APPEND_V, 0644, 0, 0);
+                                O_WRONLY_V | O_CREAT_V | O_APPEND_V, 0666, 0, 0);
     if (fdlog >= 0) {
+        shim_syscall6(__NR_fchmod, fdlog, 0666, 0, 0, 0, 0);
         shim_syscall6(__NR_write, fdlog, (long)line, p, 0, 0, 0);
         shim_syscall6(__NR_fsync, fdlog, 0, 0, 0, 0, 0);
         shim_syscall6(__NR_close, fdlog, 0, 0, 0, 0, 0);

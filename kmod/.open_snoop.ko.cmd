@@ -1,0 +1,1 @@
+cmd_/home/greg/phone/minios/kmod/open_snoop.ko := aarch64-linux-gnu-ld -EL -r -maarch64linux -z noexecstack --no-warn-rwx-segments -T ./scripts/module-common.lds -T ./arch/arm64/kernel/module.lds  --build-id  -o /home/greg/phone/minios/kmod/open_snoop.ko /home/greg/phone/minios/kmod/open_snoop.o /home/greg/phone/minios/kmod/open_snoop.mod.o ;  true

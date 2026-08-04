@@ -15,6 +15,8 @@
 #include "minios/log.h"
 #include "blockdev.h"
 #include "minios/radio.h"
+#include "modem.h"
+#include "firmware.h"
 #include "minios/selinux.h"
 #include "minios/sysfs.h"
 #include "minios/touch.h"
@@ -67,6 +69,18 @@ static void disable_cpu_idle_retry(void)
     disable_cpu_idle();
     cpu_idle_disabled = 1;
     klog("cpuidle/LPM disabled");
+}
+
+/* arch/arm64/kernel/traps.c: show_unhandled_signals defaults to 0 — no kmsg
+ * line for userspace SIGSEGV unless enabled. Live path on this kernel:
+ * /proc/sys/debug/exception-trace (not userprocess_debug). Turn on before
+ * qrtr-ns so early boot crashes print fault addr + esr in dmesg. */
+static void enable_kernel_exception_trace(void)
+{
+    if (access("/proc/sys/debug/exception-trace", W_OK) == 0) {
+        sysfs_write("/proc/sys/debug/exception-trace", "1");
+        klog("exception-trace enabled");
+    }
 }
 
 static void trim_nl(char *s)
@@ -122,8 +136,11 @@ static int early_mount_modem_partition(void)
         }
     }
     klog("early modem: firmware_mnt mounted");
+    modem_mounted = 1;
     link_modem_fw_symlinks();
-    return access("/lib/firmware/modem.mdt", R_OK) == 0 ? 0 : -1;
+    set_firmware_class_path();
+    return (access("/lib/firmware/modem.mdt", R_OK) == 0 ||
+            access("/vendor/firmware_mnt/image/modem.mdt", R_OK) == 0) ? 0 : -1;
 }
 
 static int early_vendor_mount(void)
@@ -324,6 +341,7 @@ int main(void)
     mount("devtmpfs", "/dev", "devtmpfs", 0, NULL);
     mknod("/dev/console", S_IFCHR|0600, makedev(5,1));
     mknod("/dev/null",    S_IFCHR|0666, makedev(1,3));
+    mknod("/dev/zero",    S_IFCHR|0666, makedev(1,5));
     mknod("/dev/kmsg",    S_IFCHR|0600, makedev(1,11));
     mknod("/dev/urandom", S_IFCHR|0666, makedev(1,9));
 
@@ -395,21 +413,30 @@ int main(void)
     plog_init();
     mount_pstore();
     plog_save_pstore();
-    if (!cmdline_has("minios.skip_modem=1")) {
+    /* Mount modem firmware partition early (paths only — no PIL trigger here).
+     * boot_modem() runs later from the radio job once qrtr-ns/pd-mapper/rmt_storage
+     * are already listening; early_modem_boot() burned the 40s modem bailout
+     * timer before QMI infrastructure was up. */
+    if (!cmdline_has("minios.skip_modem=1"))
         fwload_helper_start();
-        early_mount_modem_partition();
-        early_modem_boot();
-    } else {
-        klog("boot: skip modem (minios.skip_modem=1)");
-    }
+    early_mount_modem_partition();
     early_vendor_mount();
     if (access("/vendor/bin", F_OK) == 0)
         vendor_mounted = 1;
     radio_stage_early_bins();
 
-    if (!cmdline_has("minios.skip_modem=1")) {
+    /* QMI + RMTFS must be up before modem PIL — real ROM starts these on boot,
+     * well before modem reset. Do this even when skip_modem=1 (USB-safe mode)
+     * so a manual `radio` command doesn't race pd-mapper vs modem tms/pdr. */
+    if (vendor_mounted) {
+        enable_kernel_exception_trace();
+        plog_append("boot: early modem_qmi_services_start");
         modem_qmi_services_start();
+        start_rmtfs_daemons_early();
+        plog_append("boot: early qmi+rmtfs done");
     }
+
+    radio_modem_recover_stuck();
 
     klog("early modem: settle 5s");
     for (int i = 0; i < 5; i++) {
@@ -426,7 +453,11 @@ int main(void)
 
     if (!cmdline_has("minios.skip_modem=1")) {
         klog("boot: trigger auto radio init");
+        plog_append("boot: radio_init_async (wifi bringup)");
         radio_init_async();
+    } else {
+        klog("boot: skip auto radio (minios.skip_modem=1)");
+        plog_append("boot: skip auto radio — use COM `radio` to trigger");
     }
 
     /* immediate haptic ping — often works before LED drivers */

@@ -47,7 +47,7 @@
 #endif
 
 #define CNSS_EXEC_LOG "/tmp/cnss.exec.log"
-#define CNSS_BUILD_TAG "cnss-start v37-TESTMARK no-rproc"
+#define CNSS_BUILD_TAG "cnss-start v41-modem-partition"
 #define WLAN_FWPATH_MAX 18
 
 #define BT_CMD_PWR_CTRL 0xbfad
@@ -293,6 +293,7 @@ static void radio_prepare(void)
     ensure_debugfs();
     mount_radio_partitions();
     link_firmware_tree();
+    ensure_rmtfs_firmware_paths();
     write_radio_log();
 }
 
@@ -304,16 +305,21 @@ static void radio_prepare(void)
 static void radio_work(void)
 {
     LOGI("radio", "%s", "bringup start");
+    radio_trace("radio_work: begin");
+    try_load_qrtr_snoop();
     radio_prepare();
+    radio_trace("radio_prepare: mounts+rmtfs paths done");
     /* Start RMTFS serving (rmt_storage/tftp_server) right after mounts are
      * ready, before the cnss stack / modem PIL trigger — real ROM has these
      * listening from very early boot, well before modem PIL; the modem's
      * own software starts polling RMTFS immediately on leaving reset. See
      * start_rmtfs_daemons_early()'s own comment in modem.c. */
     start_rmtfs_daemons_early();
+    radio_trace("rmtfs daemons started (pre-cnss)");
     /* Let USB/COM settle before RF power (reduces dwc3 drop). */
     usleep(800000);
     try_wlan_enable();
+    radio_dump_qrtr("after try_wlan_enable");
     write_radio_status();
 
     if (radio_job_bt) {
@@ -327,6 +333,7 @@ static void radio_work(void)
     /* Always persist all runtime logs to SD at the end of radio bringup */
     plog_save_tmp_logs();
 
+    radio_trace("radio_work: done");
     LOGI("radio", "%s", "bringup done");
 }
 
@@ -647,6 +654,124 @@ int radio_format_pidinfo(char *buf, size_t bufsz)
             if (rn > 0) {
                 rb[rn] = '\0';
                 n += snprintf(buf + n, bufsz - (size_t)n, "syscall=%s\r\n", rb);
+            }
+        }
+    }
+    return n;
+}
+
+/* Same State/wchan/syscall dump as radio_format_pidinfo(), but for
+ * cnss_qrtr_pid — qrtr-ns runs as its own forked+dropped-privilege child,
+ * separate from the top-level radio_work() job, so radio-pid's own PID
+ * doesn't cover it. Added to answer directly: after drop_privileges()
+ * succeeds (uid=2906/gid=2906, confirmed via cnss-log), does qrtr-ns's
+ * process actually block/sleep somewhere (bind stuck, State=S/D) or is it
+ * already gone (no /proc/<pid> at all — silent crash, not shown by
+ * proc_running()'s own snapshot-in-time check)? */
+int radio_format_qrtr_pidinfo(char *buf, size_t bufsz)
+{
+    /* cnss_qrtr_pid, read here, lives in THIS (top-level init) process's
+     * memory — but the pid that actually matters (the one from the latest
+     * `radio` run) was written by start_cnss_stack() inside radio_work()'s
+     * forked child, which never propagates back to this process's own copy
+     * of the global. /tmp/qrtr_ns.pid is written by that same child and is
+     * visible across the fork boundary; prefer it whenever present. */
+    pid_t pid = cnss_qrtr_pid;
+    int from_file = 0;
+    {
+        int fd = open("/tmp/qrtr_ns.pid", O_RDONLY);
+        if (fd >= 0) {
+            char pb[16];
+            ssize_t pn = read(fd, pb, sizeof(pb) - 1);
+            close(fd);
+            if (pn > 0) {
+                pb[pn] = '\0';
+                int fpid = atoi(pb);
+                if (fpid > 0) {
+                    pid = (pid_t)fpid;
+                    from_file = 1;
+                }
+            }
+        }
+    }
+
+    int n = snprintf(buf, bufsz, "qrtr_ns_pid=%d alive=%d source=%s\r\n",
+                      (int)pid, pid_alive(pid), from_file ? "file" : "global(stale across fork)");
+
+    if (pid <= 0)
+        return n;
+
+    {
+        char path[64];
+        int fd;
+        char rb[512];
+        ssize_t rn;
+
+        snprintf(path, sizeof(path), "/proc/%d/status", (int)pid);
+        fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            rn = read(fd, rb, sizeof(rb) - 1);
+            close(fd);
+            if (rn > 0) {
+                rb[rn] = '\0';
+                char *line = rb;
+                while (line && *line && n < (int)bufsz - 96) {
+                    char *nl = strchr(line, '\n');
+                    if (nl) *nl = '\0';
+                    if (!strncmp(line, "State:", 6) || !strncmp(line, "Name:", 5) ||
+                        !strncmp(line, "PPid:", 5) || !strncmp(line, "Threads:", 8))
+                        n += snprintf(buf + n, bufsz - (size_t)n, "%s\r\n", line);
+                    line = nl ? nl + 1 : NULL;
+                }
+            }
+        } else {
+            n += snprintf(buf + n, bufsz - (size_t)n, "no /proc/%d/status (errno=%d)\r\n",
+                          (int)pid, errno);
+        }
+
+        snprintf(path, sizeof(path), "/proc/%d/wchan", (int)pid);
+        fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            rn = read(fd, rb, sizeof(rb) - 1);
+            close(fd);
+            if (rn > 0) {
+                rb[rn] = '\0';
+                n += snprintf(buf + n, bufsz - (size_t)n, "wchan=%s\r\n", rb);
+            } else {
+                n += snprintf(buf + n, bufsz - (size_t)n, "wchan=(empty, running)\r\n");
+            }
+        }
+
+        snprintf(path, sizeof(path), "/proc/%d/syscall", (int)pid);
+        fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            rn = read(fd, rb, sizeof(rb) - 1);
+            close(fd);
+            if (rn > 0) {
+                rb[rn] = '\0';
+                n += snprintf(buf + n, bufsz - (size_t)n, "syscall=%s\r\n", rb);
+            }
+        }
+
+        snprintf(path, sizeof(path), "/proc/%d/fd", (int)pid);
+        {
+            DIR *d = opendir(path);
+            if (d) {
+                struct dirent *e;
+                while ((e = readdir(d)) != NULL) {
+                    char lpath[96], target[128];
+                    ssize_t ln;
+                    if (e->d_name[0] == '.')
+                        continue;
+                    snprintf(lpath, sizeof(lpath), "%s/%s", path, e->d_name);
+                    ln = readlink(lpath, target, sizeof(target) - 1);
+                    if (ln > 0) {
+                        target[ln] = '\0';
+                        n += snprintf(buf + n, bufsz - (size_t)n, "fd/%s -> %s\r\n",
+                                      e->d_name, target);
+                    }
+                }
+                closedir(d);
             }
         }
     }

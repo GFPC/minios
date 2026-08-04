@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "firmware.h"
+#include "blockdev.h"
 #include "radio.h"
 #include "radio_state.h"
 #include "radio_utils.h"
@@ -172,6 +173,7 @@ void ensure_android_roots(void)
     md("/sbin");
     md("/etc");
     ensure_etc_group();
+    ensure_etc_passwd();
     md("/firmware");
     md("/firmware/image");
     md("/bt_firmware");
@@ -406,6 +408,7 @@ void sync_mount_flags(void)
 void mount_radio_partitions(void)
 {
     sync_mount_flags();
+    blockdev_ensure_by_name();
     if (!vendor_mounted || !vendor_tree_visible())
         mount_vendor_partition();
     if (!system_mounted) {
@@ -460,8 +463,23 @@ void mount_radio_partitions(void)
 
 void symlink_firmware(const char *target, const char *linkpath)
 {
-    if (!path_exists(target))
+    struct stat st;
+
+    if (!path_exists(target) || access(target, R_OK) != 0)
         return;
+    if (lstat(linkpath, &st) == 0) {
+        if (S_ISREG(st.st_mode) && access(linkpath, R_OK) == 0)
+            return;
+        if (S_ISLNK(st.st_mode)) {
+            char resolved[384];
+            ssize_t n = readlink(linkpath, resolved, sizeof(resolved) - 1);
+            if (n > 0) {
+                resolved[n] = '\0';
+                if (path_exists(resolved) && access(resolved, R_OK) == 0)
+                    return;
+            }
+        }
+    }
     unlink(linkpath);
     symlink(target, linkpath);
 }
@@ -486,19 +504,97 @@ void link_fw_bin(const char *srcdir, const char *name)
 }
 
 
-void link_modem_pil_firmware(void)
+static int modem_image_dir_ready(void)
+{
+    return path_exists("/vendor/firmware_mnt/image/modem.mdt") ||
+           path_exists("/vendor/firmware_mnt/image/wlanmdsp.mbn");
+}
+
+
+static int mount_modem_image(const char *src)
+{
+    umount2("/vendor/firmware_mnt", MNT_DETACH);
+    md("/vendor/firmware_mnt");
+    if (try_mount_ro_any(src, "/vendor/firmware_mnt") == 0)
+        return modem_image_dir_ready() ? 0 : -1;
+    return -1;
+}
+
+
+static void try_modem_sd_fallback(void)
+{
+    static const char *imgs[] = {
+        "/mnt/sdcard/minios/NON-HLOS.bin",
+        "/mnt/sdcard/minios/modem/NON-HLOS.bin",
+        "/persist/minios/NON-HLOS.bin",
+        NULL
+    };
+
+    if (modem_image_dir_ready())
+        return;
+    for (int i = 0; imgs[i]; i++) {
+        if (!path_exists(imgs[i]))
+            continue;
+        if (mount_modem_image(imgs[i]) == 0) {
+            modem_mounted = 1;
+            plog_append("modem-fw: mounted from SD NON-HLOS");
+            radio_trace("modem-fw: SD NON-HLOS mount OK");
+            return;
+        }
+    }
+}
+
+
+void set_firmware_class_path(void)
+{
+    const char *fwdir = "/lib/firmware";
+    const char *sysfs = "/sys/module/firmware_class/parameters/path";
+    char cur[256];
+    int fd;
+
+    if (path_exists("/vendor/firmware_mnt/image/modem.mdt"))
+        fwdir = "/vendor/firmware_mnt/image";
+    else if (!path_exists("/lib/firmware/modem.mdt"))
+        return;
+    fd = open(sysfs, O_RDONLY);
+    if (fd >= 0) {
+        ssize_t n = read(fd, cur, sizeof(cur) - 1);
+        close(fd);
+        if (n > 0) {
+            cur[n] = '\0';
+            {
+                char *nl = strchr(cur, '\n');
+                if (nl)
+                    *nl = '\0';
+            }
+            if (!strcmp(cur, fwdir))
+                return;
+        }
+    }
+    if (wf_checked(sysfs, fwdir) == 0) {
+        LOGI("radio", "%s %s", "fw: firmware_class.path", fwdir);
+        plog_append("fw: firmware_class.path=/vendor/firmware_mnt/image");
+    } else {
+        LOGI("radio", "%s", "fw: firmware_class.path write failed");
+        plog_append("fw: firmware_class.path write failed");
+    }
+}
+
+
+int link_modem_pil_firmware_count(void)
 {
     const char *srcdir = "/vendor/firmware_mnt/image";
     DIR *d;
     struct dirent *e;
     char src[384], dst[384];
+    int n = 0;
 
-    if (!modem_mounted || !path_exists(srcdir))
-        return;
+    if (!path_exists(srcdir))
+        return 0;
 
     d = opendir(srcdir);
     if (!d)
-        return;
+        return 0;
     while ((e = readdir(d)) != NULL) {
         if (e->d_name[0] == '.')
             continue;
@@ -507,8 +603,84 @@ void link_modem_pil_firmware(void)
         snprintf(src, sizeof(src), "%s/%s", srcdir, e->d_name);
         snprintf(dst, sizeof(dst), "/lib/firmware/%s", e->d_name);
         symlink_firmware(src, dst);
+        if (path_exists(dst))
+            n++;
     }
     closedir(d);
+    return n;
+}
+
+
+void link_modem_pil_firmware(void)
+{
+    (void)link_modem_pil_firmware_count();
+}
+
+
+int ensure_modem_pil_firmware(void)
+{
+    char line[128];
+    int links;
+    int ok_mdt = 0;
+    int ok_b = 0;
+    const char *part_mdt = "/vendor/firmware_mnt/image/modem.mdt";
+
+    ensure_modem_firmware_mounted();
+    set_firmware_class_path();
+    links = link_modem_pil_firmware_count();
+    ok_mdt = path_exists("/lib/firmware/modem.mdt") || path_exists(part_mdt);
+    if (path_exists(part_mdt)) {
+        if (copy_file_bin(part_mdt, "/lib/firmware/modem.mdt") == 0)
+            plog_append("modem-pil-fw: copied modem.mdt to /lib/firmware");
+        run_sh("cp /vendor/firmware_mnt/image/modem.b* /lib/firmware/ 2>/dev/null");
+        ok_mdt = path_exists("/lib/firmware/modem.mdt");
+        DIR *d = opendir("/vendor/firmware_mnt/image");
+        struct dirent *e;
+        if (d) {
+            while ((e = readdir(d)) != NULL) {
+                if (!strncmp(e->d_name, "modem.b", 7)) {
+                    ok_b = 1;
+                    break;
+                }
+            }
+            closedir(d);
+        }
+    }
+    if (!ok_b) {
+        for (int i = 0; i < 30; i++) {
+            char probe[64];
+            snprintf(probe, sizeof(probe), "/lib/firmware/modem.b%02d", i);
+            if (path_exists(probe)) {
+                ok_b = 1;
+                break;
+            }
+        }
+    }
+    snprintf(line, sizeof(line),
+             "modem-pil-fw: links=%d mdt=%d bseg=%d mounted=%d",
+             links, ok_mdt, ok_b, modem_mounted);
+    LOGI("radio", "%s", line);
+    plog_append(line);
+    if (!ok_mdt && path_exists("/lib/firmware/modem.mdt"))
+        ok_mdt = 1;
+    if (!ok_b) {
+        for (int i = 0; i < 30; i++) {
+            char probe[64];
+            snprintf(probe, sizeof(probe), "/lib/firmware/modem.b%02d", i);
+            if (path_exists(probe) && access(probe, R_OK) == 0) {
+                ok_b = 1;
+                break;
+            }
+        }
+    }
+    set_firmware_class_path();
+    if (!ok_mdt) {
+        plog_append("modem-pil-fw: ERROR no modem.mdt");
+        return -1;
+    }
+    if (!ok_b)
+        plog_append("modem-pil-fw: WARN no modem.b* visible (PIL may still use partition path)");
+    return 0;
 }
 
 
@@ -628,6 +800,173 @@ void link_known_firmware_bins(void)
                        "/lib/firmware/wlan/qca_cld/WCNSS_qcom_wlan_nv.bin");
     symlink_if_missing("/persist/WCNSS_qcom_wlan_nv.bin",
                        "/lib/firmware/wlan/qca_cld/WCNSS_qcom_wlan_nv.bin");
+}
+
+
+static const char *find_wlan_fw_src(const char *name)
+{
+    static const char *bases[] = {
+        "/vendor/firmware_mnt/image",
+        "/vendor/firmware/wlan/qca_cld",
+        "/lib/firmware/wlan/qca_cld",
+        NULL
+    };
+    static char path[384];
+
+    for (int i = 0; bases[i]; i++) {
+        snprintf(path, sizeof(path), "%s/%s", bases[i], name);
+        if (path_exists(path))
+            return path;
+    }
+    return NULL;
+}
+
+
+void ensure_rmtfs_readonly_layout(void)
+{
+    static const char *bins[] = {
+        "wlanmdsp.mbn",
+        "bdwlan.bin", "bdwlan.b02", "bdwlan.b04", "bdwlan.b05",
+        "bdwlan.b06", "bdwlan.b07", "bdwlan.b08", "bdwlan.b09",
+        "bdwlan.b0a", "bdwlan.b0b",
+        NULL
+    };
+    static const char *link_fmt[] = {
+        "/readonly/firmware/image/%s",
+        "/readonly/vendor/firmware/%s",
+        "/readonly/vendor/firmware_mnt/image/%s",
+        NULL
+    };
+    char link[384];
+    int linked = 0;
+
+    md("/readonly/firmware/image");
+    md("/readonly/vendor/firmware");
+    md("/readonly/vendor/firmware_mnt/image");
+
+    for (int i = 0; bins[i]; i++) {
+        const char *src = find_wlan_fw_src(bins[i]);
+        if (!src)
+            continue;
+        for (int j = 0; link_fmt[j]; j++) {
+            snprintf(link, sizeof(link), link_fmt[j], bins[i]);
+            symlink_firmware(src, link);
+            if (path_exists(link))
+                linked++;
+        }
+    }
+    {
+        char line[96];
+        const char *wm = find_wlan_fw_src("wlanmdsp.mbn");
+        snprintf(line, sizeof(line), "rmtfs-readonly: wlanmdsp=%s links=%d",
+                 wm ? wm : "missing", linked);
+        radio_trace(line);
+    }
+}
+
+
+void ensure_rmtfs_boot_paths(void)
+{
+    static const struct {
+        const char *link;
+        const char *parts[4];
+    } map[] = {
+        { "/boot/modem_fs1", { "modemst1", "fsc", NULL } },
+        { "/boot/modem_fs2", { "modemst2", NULL } },
+        { "/boot/modem_fsg", { "fsg", NULL } },
+        { "/boot/modem_fsc", { "fsc", NULL } },
+        { NULL, { NULL } }
+    };
+    int n = 0;
+
+    md("/boot");
+    for (int i = 0; map[i].link; i++) {
+        if (path_exists(map[i].link))
+            continue;
+        for (int j = 0; map[i].parts[j]; j++) {
+            const char *dev = blockdev_by_name(map[i].parts[j]);
+            if (!dev)
+                continue;
+            symlink_if_missing(dev, map[i].link);
+            if (path_exists(map[i].link)) {
+                char line[128];
+                snprintf(line, sizeof(line), "rmtfs-boot: %s -> %s",
+                         map[i].link, dev);
+                radio_trace(line);
+                n++;
+                break;
+            }
+        }
+    }
+    if (n == 0)
+        radio_trace("rmtfs-boot: no /boot/modem_* symlinks created");
+}
+
+
+int ensure_modem_firmware_mounted(void)
+{
+    static const char *parts[] = { "modem", "modem_a", "modem_b", NULL };
+    static const char *probe = "/vendor/firmware_mnt/image/wlanmdsp.mbn";
+
+    if (modem_image_dir_ready())
+        return 0;
+
+    for (int i = 0; i < 30; i++) {
+        blockdev_ensure_by_name();
+        sync_mount_flags();
+        if (!modem_image_dir_ready()) {
+            for (int p = 0; parts[p]; p++) {
+                const char *dev = blockdev_by_name(parts[p]);
+                if (!dev)
+                    continue;
+                if (mount_modem_image(dev) == 0) {
+                    modem_mounted = 1;
+                    plog_append("modem-fw: GPT modem partition OK");
+                    break;
+                }
+            }
+        }
+        if (!modem_image_dir_ready())
+            try_modem_sd_fallback();
+        if (path_exists(probe) || modem_image_dir_ready()) {
+            char line[128];
+            snprintf(line, sizeof(line), "modem-fw: ready mdt=%d wlanmdsp=%d",
+                     path_exists("/vendor/firmware_mnt/image/modem.mdt"),
+                     path_exists(probe));
+            radio_trace(line);
+            plog_append(line);
+            return 0;
+        }
+        if (i == 0 || (i % 4) == 0) {
+            char line[96];
+            snprintf(line, sizeof(line), "modem-fw: wait i=%d mounted=%d",
+                     i, modem_mounted);
+            radio_trace(line);
+        }
+        usleep(500000);
+    }
+    radio_trace("modem-fw: modem partition empty/missing after 15s");
+    plog_append("modem-fw: ERROR partition empty — flash NON-HLOS.bin");
+    return -1;
+}
+
+
+void ensure_rmtfs_firmware_paths(void)
+{
+    ensure_modem_firmware_mounted();
+    ensure_rmtfs_boot_paths();
+    link_modem_pil_firmware();
+    harvest_fw_bins("/vendor/firmware_mnt/image", 1);
+    ensure_rmtfs_readonly_layout();
+    if (!path_exists("/readonly/firmware/image/wlanmdsp.mbn")) {
+        const char *src = find_wlan_fw_src("wlanmdsp.mbn");
+        if (src) {
+            symlink_firmware(src, "/readonly/firmware/image/wlanmdsp.mbn");
+            symlink_firmware(src, "/readonly/vendor/firmware/wlanmdsp.mbn");
+            symlink_firmware(src, "/readonly/vendor/firmware_mnt/image/wlanmdsp.mbn");
+            radio_trace("rmtfs-readonly: wlanmdsp symlinks forced from late mount");
+        }
+    }
 }
 
 
