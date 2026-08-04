@@ -235,10 +235,30 @@ void start_logd_stub(void)
 {
     static const char *path = "/sbin/logd_stub";
     char *argv[] = { (char *)"logd_stub", NULL };
+    pid_t p;
 
     if (proc_running("logd_stub") || !path_exists(path))
         return;
-    if (start_vendor_daemon(path, argv) > 0)
+    /* Unlike real vendor daemons (dynamically linked against Android's own
+     * libc/liblog, needing exec_via_linker64()), logd_stub is one of our
+     * own tools, built -static (see minios/Makefile) -- a plain ET_EXEC
+     * ELF the kernel loads directly, no interpreter at all. Routing it
+     * through start_vendor_daemon()'s linker64-first exec unconditionally
+     * fails: the real Android linker64 refuses a non-PIE ELF outright
+     * ("has unexpected e_type: 2") and exits immediately, so logd_stub
+     * never actually started this whole project until now -- confirmed
+     * via catlog logd_stub showing exactly that linker64 error. */
+    p = fork();
+    if (p == 0) {
+        setsid();
+        int fd = open("/dev/null", O_RDONLY);
+        if (fd >= 0) { dup2(fd, 0); close(fd); }
+        fd = open("/tmp/logd_stub.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); close(fd); }
+        execv(path, argv);
+        _exit(127);
+    }
+    if (p > 0)
         LOGI("radio", "%s", "logd_stub started");
 }
 

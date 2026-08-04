@@ -19,6 +19,7 @@ void radio_probe_now(void);
 void start_diag_klog(void);
 void start_diag_mdlog(void);
 const char *vendor_bin(const char *name);
+int path_exists(const char *p);
 
 void radio_scan_request_async(void);
 void radio_poll(void);

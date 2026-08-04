@@ -257,7 +257,7 @@ int com_handle(int out, const char *line)
     if (!strcmp(line, "ping"))
         return write(out, "pong\r\n", 6), 1;
     if (!strcmp(line, "help")) {
-        const char *h = "commands: ping help status usb net drm dmesg dmesg-find kms touch touchmon adb adb-tcp adb-on usb-adb com-on ffslog fb radio wifi bt wifi-scan scan-result radio-log cnss-log crash-log qrtr-log pd-log icnss-state binder-state catlog qrtr-lookup diag-klog diag-mdlog qmdl-find vendor-has usb-diag proc-info radio-diag radio-pid qrtr-pid radio-ls wifi-fw metrics save-log sync clean-logs bt-attach modem-state boot-count pstore poweroff reboot recovery mount-debugfs\r\n";
+        const char *h = "commands: ping help status usb net drm dmesg dmesg-find kms touch touchmon adb adb-tcp adb-on usb-adb com-on ffslog fb radio wifi bt wifi-scan scan-result radio-log cnss-log crash-log qrtr-log pd-log icnss-state binder-state catlog qrtr-lookup diag-klog diag-mdlog qmdl-find vendor-has usb-diag proc-info logd-trace readfile radio-diag radio-pid qrtr-pid radio-ls wifi-fw metrics save-log sync clean-logs bt-attach modem-state boot-count pstore poweroff reboot recovery mount-debugfs\r\n";
         write(out, h, strlen(h));
         return 1;
     }
@@ -582,6 +582,15 @@ int com_handle(int out, const char *line)
         com_read_file_out(out, "/tmp/cnss.exec.log", "no cnss exec log yet\r\n");
         return 1;
     }
+    /* logd-trace: read logd_stub.c's captured __android_log_print/liblog
+     * traffic (minios/firmware/adb/logd_stub.c). Every daemon that links
+     * liblog.so (cnss-daemon, pd-mapper, hwservicemanager, irsc_util, ...)
+     * sends ALL its logging through this socket -- previously invisible
+     * since nothing was ever checking this specific file this session. */
+    if (!strcmp(line, "logd-trace")) {
+        com_read_file_out(out, "/mnt/sdcard/minios/logd_trace.log", "no logd trace yet\r\n");
+        return 1;
+    }
     if (!strcmp(line, "crash-log") || !strcmp(line, "plog")) {
         /* Widened from 16KB/12000 — the known USB-PHY-drop reconnect spam
          * (~86ms/line) can fill that whole window in about a second, which
@@ -778,6 +787,14 @@ int com_handle(int out, const char *line)
             write(out, b, (size_t)n);
         return 1;
     }
+    /* readfile <path>: cat an arbitrary file, absolute path required.
+     * General-purpose (sysfs attributes, /proc/mounts, etc.) -- catlog/
+     * crash-log/cnss-log/logd-trace are all this same read pattern
+     * hardcoded to one specific path each; this covers everything else. */
+    if (!strncmp(line, "readfile ", 9)) {
+        com_read_file_out(out, line + 9, "no such file\r\n");
+        return 1;
+    }
     /* catlog <name>: dump the tail of /tmp/<name>.log — start_vendor_daemon()
      * redirects each daemon's stdout/stderr there, so this shows exactly why
      * e.g. hwservicemanager exited instead of just that it isn't running. */
@@ -856,10 +873,16 @@ int com_handle(int out, const char *line)
         return 1;
     }
     if (!strncmp(line, "vendor-has ", 11)) {
-        const char *found = vendor_bin(line + 11);
+        const char *arg = line + 11;
         char b[220];
-        int n = snprintf(b, sizeof(b), "%s: %s\r\n", line + 11,
-                          found ? found : "not found");
+        int n;
+        if (arg[0] == '/') {
+            n = snprintf(b, sizeof(b), "%s: %s\r\n", arg,
+                         path_exists(arg) ? "exists" : "not found");
+        } else {
+            const char *found = vendor_bin(arg);
+            n = snprintf(b, sizeof(b), "%s: %s\r\n", arg, found ? found : "not found");
+        }
         write(out, b, (size_t)n);
         return 1;
     }

@@ -265,6 +265,62 @@ int try_mount_ro_any(const char *src, const char *dst)
 }
 
 
+/* persist (unlike system/vendor/modem/bluetooth firmware images) is meant
+ * to be writable at runtime -- real Android mounts it read-write, since
+ * tftp_server/rmt_storage create and lchown /mnt/vendor/persist/rfs/* and
+ * /mnt/vendor/persist/hlos_rfs/* there during every boot's RFS/EFS sync.
+ * try_mount_part()/try_mount_ro_any() forced MS_RDONLY unconditionally
+ * here too, so every one of those mkdir/lchown calls failed with EROFS --
+ * completely invisible all project until logd_stub started actually
+ * capturing the liblog-routed tftp_server error output that revealed it
+ * ("mkdir failed: [30] [/mnt/vendor/persist] [Read-only file system]"). */
+int try_mount_rw(const char *src, const char *dst, const char *fstype)
+{
+    md(dst);
+    if (mount(src, dst, fstype, 0, NULL) == 0) {
+        LOGI("radio", "%s %s", "mounted rw", dst);
+        return 0;
+    }
+    {
+        char msg[192];
+        snprintf(msg, sizeof(msg), "mount rw %s %s fail: %s", dst, fstype,
+                 strerror(errno));
+        LOGI("radio", "%s", msg);
+    }
+    return -1;
+}
+
+
+int try_mount_rw_any(const char *src, const char *dst)
+{
+    const char *types[] = { "ext4", "erofs", "f2fs", "vfat", NULL };
+    int last_errno = 0;
+
+    for (int i = 0; types[i]; i++) {
+        if (try_mount_rw(src, dst, types[i]) == 0)
+            return 0;
+        last_errno = errno;
+    }
+    if (last_errno) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "mount rw fail %s errno=%d", dst, last_errno);
+        LOGI("radio", "%s", msg);
+    }
+    return -1;
+}
+
+
+int try_mount_part_rw(const char *part, const char *dst)
+{
+    const char *dev = blockdev_by_name(part);
+    if (!dev) {
+        LOGI("radio", "%s %s", "mount: no blockdev", part);
+        return -1;
+    }
+    return try_mount_rw_any(dev, dst);
+}
+
+
 int try_mount_part(const char *part, const char *dst)
 {
     const char *dev = blockdev_by_name(part);
@@ -436,13 +492,38 @@ void mount_radio_partitions(void)
         modem_mounted = 1;
     if (!bt_fw_mounted && try_mount_part("bluetooth", "/vendor/bt_firmware") == 0)
         bt_fw_mounted = 1;
-    if (!persist_mounted && try_mount_part("persist", "/mnt/vendor/persist") == 0) {
+    /* /mnt/vendor/persist can't be created: it's not a pre-baked mountpoint
+     * dir in this vendor.img (confirmed live: path_exists() is false), and
+     * /mnt/vendor itself is mounted MS_RDONLY, so mkdir() into it fails
+     * with EROFS -- every mount attempt targeting /mnt/vendor/persist was
+     * therefore silently doomed regardless of the rw-vs-ro mount flags
+     * fixed above (confirmed via tftp_server's own liblog output, only
+     * visible now that logd_stub actually works: "mkdir failed: [30]
+     * [/mnt/vendor/persist] [Read-only file system]"). Remount /mnt/vendor
+     * rw just long enough to create the one directory, then back to ro --
+     * this doesn't touch any real vendor.img file content, just adds an
+     * empty mountpoint stub real Android's vendor.img apparently already
+     * ships with (this one evidently doesn't). */
+    if (!mount_point_active("/mnt/vendor/persist") &&
+        access("/mnt/vendor/persist", F_OK) != 0 &&
+        mount_point_active("/mnt/vendor")) {
+        if (mount(NULL, "/mnt/vendor", NULL, MS_REMOUNT, NULL) == 0) {
+            if (mkdir("/mnt/vendor/persist", 0755) == 0)
+                LOGI("radio", "%s", "created /mnt/vendor/persist mountpoint");
+            else
+                LOGI("radio", "%s", "mkdir /mnt/vendor/persist still failed after remount rw");
+            mount(NULL, "/mnt/vendor", NULL, MS_REMOUNT | MS_RDONLY, NULL);
+        } else {
+            LOGI("radio", "%s", "remount /mnt/vendor rw failed");
+        }
+    }
+    if (!persist_mounted && try_mount_part_rw("persist", "/mnt/vendor/persist") == 0) {
         persist_mounted = 1;
     }
-    if (!persist_mounted && try_mount_part("persistbak", "/mnt/vendor/persist") == 0) {
+    if (!persist_mounted && try_mount_part_rw("persistbak", "/mnt/vendor/persist") == 0) {
         persist_mounted = 1;
     }
-    if (!persist_mounted && try_mount_part("persistbak", "/persist") == 0) {
+    if (!persist_mounted && try_mount_part_rw("persistbak", "/persist") == 0) {
         persist_mounted = 1;
     }
     if (persist_mounted && mount_point_active("/persist") &&
