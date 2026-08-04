@@ -185,7 +185,7 @@ int com_handle(int out, const char *line)
     if (!strcmp(line, "ping"))
         return write(out, "pong\r\n", 6), 1;
     if (!strcmp(line, "help")) {
-        const char *h = "commands: ping help status usb net drm dmesg dmesg-find kms touch touchmon adb adb-tcp adb-on usb-adb com-on ffslog fb radio wifi bt wifi-scan scan-result radio-log cnss-log crash-log qrtr-log pd-log icnss-state binder-state catlog qrtr-lookup radio-diag radio-pid qrtr-pid radio-ls wifi-fw metrics save-log sync clean-logs bt-attach modem-state boot-count pstore poweroff reboot recovery mount-debugfs\r\n";
+        const char *h = "commands: ping help status usb net drm dmesg dmesg-find kms touch touchmon adb adb-tcp adb-on usb-adb com-on ffslog fb radio wifi bt wifi-scan scan-result radio-log cnss-log crash-log qrtr-log pd-log icnss-state binder-state catlog qrtr-lookup diag-klog radio-diag radio-pid qrtr-pid radio-ls wifi-fw metrics save-log sync clean-logs bt-attach modem-state boot-count pstore poweroff reboot recovery mount-debugfs\r\n";
         write(out, h, strlen(h));
         return 1;
     }
@@ -670,6 +670,11 @@ int com_handle(int out, const char *line)
             n = r > 0 ? (int)r : snprintf(b, sizeof(b), "qrtr-lookup: empty output\r\n");
         }
         write(out, b, (size_t)n);
+        return 1;
+    }
+    if (!strcmp(line, "diag-klog")) {
+        start_diag_klog();
+        write(out, "diag_klog started — modem F3 log routed to dmesg, check: dmesg-find <term>\r\n", 78);
         return 1;
     }
     if (!strcmp(line, "radio-diag")) {

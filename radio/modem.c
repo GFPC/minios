@@ -272,6 +272,29 @@ static void start_tftp_server(void)
     }
 }
 
+/* Diagnostic only (not part of normal boot): routes modem DIAG F3 debug
+ * messages into the AP's own kernel log via klogctl(), so `dmesg` shows
+ * modem-firmware-side log lines directly -- no QXDM/database decoding
+ * needed since diag_klog does the formatting itself using the on-device
+ * libdiag.so. Used to investigate why wlfw never registers (MEMORY.md
+ * §4.5b1/b2): every AP-side signal (RFS, PDR/locator, kernel QMI client)
+ * is confirmed healthy, so the remaining question is what the modem's own
+ * firmware is doing/waiting on, which only a modem-side log can show. */
+void start_diag_klog(void)
+{
+    if (proc_running("diag_klog"))
+        return;
+    const char *bin = stage_vendor_bin("diag_klog");
+    if (!bin) {
+        LOGI("radio", "%s", "diag_klog: not found on vendor");
+        return;
+    }
+    char *argv[] = { (char *)"diag_klog", NULL };
+    pid_t p = start_vendor_daemon(bin, argv);
+    LOGI("radio", "diag_klog: start pid=%d", (int)p);
+    plog_append(p > 0 ? "diag_klog: started" : "diag_klog: start failed");
+}
+
 /* Both daemons above used to only start deep inside boot_modem(), which
  * itself (per §4.5v) now deliberately runs LAST — after qrtr-ns/pd-mapper/
  * cnss-daemon are already up, to match real-ROM's observed modem-PIL-

@@ -16,6 +16,7 @@ void try_load_qrtr_snoop(void);
 void radio_early_modem_boot(void);
 void radio_stage_early_bins(void);
 void radio_probe_now(void);
+void start_diag_klog(void);
 
 void radio_scan_request_async(void);
 void radio_poll(void);

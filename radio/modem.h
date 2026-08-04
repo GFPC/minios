@@ -16,5 +16,6 @@ int wait_modem_online(int max_sec);
 void radio_early_modem_boot(void);
 void start_rmtfs_daemons_early(void);
 void radio_modem_recover_stuck(void);
+void start_diag_klog(void);
 
 #endif
