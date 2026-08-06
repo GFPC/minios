@@ -144,6 +144,21 @@ static const struct {
 	{ "ro.vendor.qti.soc_model", "SM6125" },
 	{ "ro.vendor.qti.soc_id", "400" },
 	{ "persist.vendor.radio.atfwd.start", "true" },
+	/* cnss-daemon's wsvc_printf() has TWO independent gates, not one:
+	 * priority > wsvc_debug_level -> skipped entirely (controlled by the
+	 * -d/-dd argv flags, already raised in radio/cnss.c's argv), AND
+	 * separately priority > wsvc_kmsg_logging -> not written to kmsg even
+	 * if it passed the first gate. wsvc_kmsg_logging is ONLY settable via
+	 * this property (property_get_int32("persist.vendor.cnss-daemon.
+	 * kmsg_logging", wsvc_kmsg_logging) — no command-line flag for it at
+	 * all) — confirmed via decompile this session: -dd alone was not
+	 * enough to see priority-3/4 messages (WLFW service connected, FW
+	 * status: 0x%lx, FW memory is ready, Wait for FW memory ready
+	 * indication, Received FW memory ready indication) even though -dd
+	 * definitely raised wsvc_debug_level (confirmed via the real argv in
+	 * cnss.exec.log). Set to 4 (max) so every priority level reaches
+	 * kmsg. */
+	{ "persist.vendor.cnss-daemon.kmsg_logging", "4" },
 	{ 0, 0 }
 };
 

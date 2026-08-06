@@ -463,11 +463,21 @@ pid_t start_cnss_daemon(const char *path)
     run = stage_cnss_daemon(path);
 
     {
-        char *a0[] = { (char *)"cnss-daemon", (char *)"-n", (char *)"-l", NULL };
-        char *a1[] = { (char *)"cnss-daemon", (char *)"-n", NULL };
+        /* -d twice (max verbosity, see cnss-daemon's own usage string:
+         * "-dd for more") -- default wsvc_debug_level only shows priority
+         * <=2 messages (confirmed via SD-card boot.log across dozens of
+         * boots: "wlfw_start: Starting"/priority 2 always present, but
+         * "WLFW service connected"/"FW status: 0x%lx"/priority 3 and
+         * "FW memory is ready"/"Wait for FW memory ready indication"/
+         * "Received FW memory ready indication"/priority 4 never appear
+         * even once -- meaning this project has never actually been able
+         * to observe from logs alone whether wlfw_napier_init() reaches,
+         * blocks on, or gets signaled past its FW_MEM_READY wait). */
+        char *a0[] = { (char *)"cnss-daemon", (char *)"-n", (char *)"-l", (char *)"-d", (char *)"-d", NULL };
+        char *a1[] = { (char *)"cnss-daemon", (char *)"-n", (char *)"-d", (char *)"-d", NULL };
         struct { char *label; char **argv; } tries[] = {
-            { "try0: -n -l (init.rc)", a0 },
-            { "try1: -n", a1 },
+            { "try0: -n -l -d -d (init.rc + max verbosity)", a0 },
+            { "try1: -n -d -d", a1 },
         };
 
         for (size_t i = 0; i < sizeof(tries) / sizeof(tries[0]); i++) {
