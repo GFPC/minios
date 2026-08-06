@@ -16,6 +16,17 @@
 typedef __SIZE_TYPE__  size_t;
 typedef __INTPTR_TYPE__ intptr_t;
 
+/* Bionic's real per-thread errno accessor. Raw syscalls (shim_syscall6)
+ * return -errno directly on failure, NOT -1-with-errno-set the way libc
+ * wrappers do -- fine for opendir() above (checked directly against the
+ * raw value, and its own retry loop does the same), but openat()/open()
+ * below are a generic override loaded into every LD_PRELOADed daemon
+ * (rmt_storage, cnss-daemon, qrtr-ns, pd-mapper...), and real code
+ * everywhere checks errno after a failed open() (e.g. "if ENOENT, try a
+ * fallback path"). Without this, every such check reads a stale/garbage
+ * errno instead of the real failure reason. */
+extern int *__errno(void);
+
 /* ------------------------------------------------------------------ */
 /* memset_explicit / __memset_explicit                                  */
 /* ------------------------------------------------------------------ */
@@ -684,4 +695,86 @@ DIR *opendir(const char *path)
     if (fd < 0)
         return (DIR *)0;
     return fdopendir((int)fd);
+}
+
+
+static int shim_path_has(const char *path, const char *needle)
+{
+    int ci, ni;
+
+    if (!path)
+        return 0;
+    for (ci = 0; path[ci]; ci++) {
+        for (ni = 0; needle[ni] && path[ci + ni] == needle[ni]; ni++)
+            ;
+        if (!needle[ni])
+            return 1;
+    }
+    return 0;
+}
+
+/* cnss-daemon connects to wlfw (confirmed via the QMI wire-trace above) but
+ * then never sends WLFW_CAP_REQ the way real Lineage's cnss-daemon does
+ * within milliseconds of connecting -- real Lineage's own logcat shows the
+ * step in between is 5 wlfw_cal_NN.bin open() attempts under
+ * /data/vendor/wifi/ (all ENOENT there too, non-fatal). Neither opendir()
+ * above nor the QMI sendto/recvfrom hook cover plain open()/openat(), so we
+ * have no visibility into whether cnss-daemon ever reaches that step at
+ * all. Hook it here, logging only "wifi"-path opens to keep noise down. */
+int openat(int dirfd, const char *path, int flags, ...)
+{
+    long fd;
+    char line[300];
+    int p = 0;
+    int interesting = shim_path_has(path, "wifi");
+    int mode = 0;
+
+    if (flags & O_CREAT_V) {
+        __builtin_va_list ap;
+        __builtin_va_start(ap, flags);
+        mode = __builtin_va_arg(ap, int);
+        __builtin_va_end(ap);
+    }
+
+    fd = shim_syscall6(__NR_openat, dirfd, (long)path, flags, mode, 0, 0);
+
+    if (interesting) {
+        shim_copy(line, &p, "SHIM openat path=");
+        shim_copy(line, &p, path ? path : "(null)");
+        if (fd < 0) {
+            shim_copy(line, &p, " errno=");
+            p += shim_udec((unsigned)(-fd), line + p);
+        } else {
+            shim_copy(line, &p, " fd=");
+            p += shim_udec((unsigned)fd, line + p);
+        }
+        line[p++] = '\n';
+        {
+            int fdlog = (int)shim_syscall6(__NR_openat, AT_FDCWD_V, (long)"/dev/kmsg",
+                                            O_WRONLY_V | O_APPEND_V, 0, 0, 0);
+            if (fdlog >= 0) {
+                shim_syscall6(__NR_write, fdlog, (long)line, p, 0, 0, 0);
+                shim_syscall6(__NR_close, fdlog, 0, 0, 0, 0, 0);
+            }
+        }
+    }
+
+    if (fd < 0) {
+        *__errno() = (int)(-fd);
+        return -1;
+    }
+    return (int)fd;
+}
+
+int open(const char *path, int flags, ...)
+{
+    int mode = 0;
+
+    if (flags & O_CREAT_V) {
+        __builtin_va_list ap;
+        __builtin_va_start(ap, flags);
+        mode = __builtin_va_arg(ap, int);
+        __builtin_va_end(ap);
+    }
+    return openat(AT_FDCWD_V, path, flags, mode);
 }
