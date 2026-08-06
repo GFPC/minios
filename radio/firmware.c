@@ -594,6 +594,20 @@ static int modem_image_dir_ready(void)
 
 static int mount_modem_image(const char *src)
 {
+    /* Guard against a real, confirmed live race: this function's own
+     * unmount+remount is disruptive (the mountpoint briefly has nothing
+     * mounted on it at all), and it has multiple independent callers
+     * (ensure_modem_firmware_mounted()'s own retry loop, reached from at
+     * least 4 different places across cnss.c/firmware.c/modem.c, several
+     * of which run in their own forked processes). If /vendor/firmware_mnt
+     * is already correctly populated, do nothing -- confirmed live via an
+     * LD_PRELOAD opendir() trace that pd-mapper's opendir() on
+     * /vendor/firmware_mnt/image got a real ENOENT at the exact moment
+     * another caller's concurrent remount here would have torn the
+     * mountpoint down, despite the directory being verified present and
+     * populated a moment before and after. */
+    if (modem_image_dir_ready())
+        return 0;
     umount2("/vendor/firmware_mnt", MNT_DETACH);
     md("/vendor/firmware_mnt");
     if (try_mount_ro_any(src, "/vendor/firmware_mnt") == 0)

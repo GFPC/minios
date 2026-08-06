@@ -24,6 +24,7 @@ pid_t start_cnss_daemon(const char *path);
 void daemon_child_setup(const char *path, const char *logfile);
 pid_t start_vendor_daemon(const char *path, char *const argv[]);
 pid_t start_vendor_daemon_dropped(const char *path, char *const argv[], void (*drop)(void));
+pid_t start_vendor_daemon_dropped_execfirst(const char *path, char *const argv[], void (*drop)(void));
 void run_vendor_oneshot(const char *path, char *const argv[]);
 /* Bounded wait — kills child after timeout_sec (SIGKILL). Returns 0 if exited,
  * 1 on timeout/kill, -1 if start failed. */

@@ -40,22 +40,37 @@ void ensure_cnss_devnodes(void)
     unsigned maj, min;
     int fd;
 
-    if (path_exists("/dev/diag"))
-        return;
-    fd = open("/sys/class/diag/diag/dev", O_RDONLY);
-    if (fd < 0)
-        fd = open("/sys/devices/virtual/diag/diag/dev", O_RDONLY);
-    if (fd < 0)
-        return;
-    if (read(fd, buf, sizeof(buf) - 1) <= 0) {
+    /* Real ueventd.rc: /dev/diag 0660 system vendor_qti_diag (uid=1000,
+     * gid=2901 -- confirmed via stock_miui/vendor_tree/etc/group). This
+     * used to return early here without ever chmod/chown-ing whenever
+     * devtmpfs had already auto-created the node itself (same devtmpfs-
+     * timing race as /dev/zero, /dev/uioN, /dev/kmsg elsewhere in this
+     * project) --
+     * silently leaving it root:root at whatever default mode the diag
+     * driver's own devnode() callback picked, which every non-root diag
+     * client (QMID/ims-qmi-daemon/RILD, confirmed via logd_stub finally
+     * capturing their liblog output: "Diag_LSM_Init: Failed to open
+     * handle to diag driver, error = 13") then failed to open. Now
+     * unconditionally fixes perms/ownership regardless of who created
+     * the node or whether this is a repeat call. */
+    if (!path_exists("/dev/diag")) {
+        fd = open("/sys/class/diag/diag/dev", O_RDONLY);
+        if (fd < 0)
+            fd = open("/sys/devices/virtual/diag/diag/dev", O_RDONLY);
+        if (fd < 0)
+            return;
+        if (read(fd, buf, sizeof(buf) - 1) <= 0) {
+            close(fd);
+            return;
+        }
         close(fd);
-        return;
+        if (sscanf(buf, "%u:%u", &maj, &min) != 2)
+            return;
+        mknod("/dev/diag", S_IFCHR | 0660, makedev(maj, min));
+        LOGI("radio", "%s", "cnss: /dev/diag created");
     }
-    close(fd);
-    if (sscanf(buf, "%u:%u", &maj, &min) != 2)
-        return;
-    mknod("/dev/diag", S_IFCHR | 0666, makedev(maj, min));
-    LOGI("radio", "%s", "cnss: /dev/diag created");
+    chmod("/dev/diag", 0660);
+    chown("/dev/diag", 1000, 2901);
 }
 
 
@@ -181,6 +196,21 @@ void cnss_drop_privileges(uid_t uid, gid_t gid, const gid_t *groups, int ngroups
     }
     if (keep_cap)
         cnss_raise_cap(keep_cap, label);
+
+    /* setuid()/setgid() away from root clears the process's dumpable flag
+     * (kernel: commit_creds() -> set_dumpable(SUID_DUMP_DISABLE)) unless the
+     * new creds already had elevated privilege carried over via a kept
+     * capability. Non-dumpable restricts /proc/self/* for the process itself
+     * -- and bionic's linker64 reads /proc/self/maps during its own
+     * self-relocation on some builds. qrtr-ns and pd-mapper (keep_cap=0,
+     * plain uid/gid drop) both crash inside linker64 at a fixed small offset
+     * (NULL+0xa0, translation fault, confirmed via dmesg with
+     * exception-trace enabled) right after this privilege drop, while
+     * cnss-daemon (keep_cap=CAP_NET_ADMIN) does not -- restore dumpable
+     * explicitly here so linker64 sees the same /proc/self access either
+     * way. */
+    if (prctl(PR_SET_DUMPABLE, 1) != 0)
+        cnss_log_line("prctl(SET_DUMPABLE) failed (non-fatal)");
 
     snprintf(msg, sizeof(msg), "%s: dropped uid=%d gid=%d", label, getuid(), getgid());
     cnss_log_line(msg);
@@ -522,6 +552,58 @@ pid_t start_vendor_daemon_dropped(const char *path, char *const argv[], void (*d
     return start_vendor_daemon_impl(path, argv, drop);
 }
 
+/* pd-mapper-specific: plain execve() first, exec_via_linker64() as fallback
+ * -- the opposite order from start_vendor_daemon_impl() above, mirroring
+ * cnss_try_exec()'s order (the path cnss-daemon uses, and which works
+ * correctly). Root-caused live via Ghidra + a real-vs-MiniOS wire capture
+ * of pd-mapper's own wlan/fw servreg query: the QMI request/response
+ * protocol is byte-identical to a working real-Lineage capture, proving
+ * pd-mapper's QMI server itself runs fine -- but its response always
+ * reports zero domains, traced to its static `json_dir_list` global
+ * (holding the config search paths) reading back as an all-NULL array at
+ * runtime despite a valid R_AARCH64_RELATIVE relocation for it existing in
+ * the ELF file itself (confirmed via readelf -r). That points at the
+ * manual "linker64 argv[1]=target" invocation path specifically failing to
+ * apply this relocation for pd-mapper, not a data or permissions problem --
+ * qrtr-ns's earlier, unrelated crash bug (fixed separately, /dev/null
+ * permissions) was already confirmed identical regardless of exec
+ * mechanism, but this is a different bug class (silent data corruption,
+ * not a crash) so that earlier finding doesn't rule this out. Try plain
+ * execve() (kernel's own normal PT_INTERP-driven load, same as any regular
+ * process start) first for pd-mapper specifically, since that's the
+ * mechanism cnss-daemon already uses successfully. */
+pid_t start_vendor_daemon_dropped_execfirst(const char *path, char *const argv[], void (*drop)(void))
+{
+    pid_t p;
+    char logfile[128];
+    const char *name;
+
+    if (!path || !path_exists(path))
+        return 0;
+
+    name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+    snprintf(logfile, sizeof(logfile), "/tmp/%s.log", name);
+
+    p = fork();
+    if (p != 0)
+        return p > 0 ? p : 0;
+
+    daemon_child_setup(path, logfile);
+    if (drop)
+        drop();
+    execv(path, argv);
+    exec_via_linker64(path, argv);
+    {
+        char msg[192];
+        snprintf(msg, sizeof(msg), "exec fail %s errno=%d (%s)", path, errno, strerror(errno));
+        LOGI("radio", "%s", msg);
+        int fd = open(logfile, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) { dprintf(fd, "%s\n", msg); close(fd); }
+    }
+    _exit(127);
+}
+
 
 void run_vendor_oneshot(const char *path, char *const argv[])
 {
@@ -738,6 +820,28 @@ void stage_cnss_libs(void)
                 copy_file_bin(src, dst);
         }
     }
+    /* MiniOS pm-service stub: override the vendor libperipheral_client.so with our
+     * minimal stub immediately after the main staging loop so that cnss-daemon
+     * does not spin forever waiting for a pm-service QMI server that does not
+     * exist on MiniOS.  The real vendor .so busy-loops inside pm_client_connect()
+     * trying to connect to the Peripheral Manager QMI service; our stub grants
+     * ACCESS_ALLOWED immediately via a direct callback, allowing cnss-daemon to
+     * proceed to the actual WLFW bring-up sequence.
+     * The stub .so lives at /lib64/pm_client_stub.so (baked into initramfs by
+     * build-minios-hybrid.sh) and is installed here, after the vendor_force[]
+     * loop would have just overwritten /lib64/libperipheral_client.so with the
+     * broken vendor version. */
+    {
+        const char *pm_stub = "/lib64/pm_client_stub.so";
+        const char *pm_dst  = "/lib64/libperipheral_client.so";
+        if (path_exists(pm_stub)) {
+            copy_file_bin(pm_stub, pm_dst);
+            LOGI("radio", "%s", "pm_client: stub installed over vendor version");
+        } else {
+            LOGI("radio", "%s", "pm_client: stub not found at /lib64/pm_client_stub.so -- vendor version active");
+        }
+    }
+
     unlink("/lib64/libqrtr.so");
     if (path_exists("/vendor/lib64/libqrtr.so"))
         symlink_force("/vendor/lib64/libqrtr.so", "/lib64/libqrtr.so");
@@ -1018,6 +1122,75 @@ static void start_netmgrd(void)
 }
 
 
+/* Passive readiness check for pd-mapper's config source, used instead of
+ * calling ensure_modem_firmware_mounted() directly at each pd-mapper spawn
+ * site: that function can itself (re)mount /vendor/firmware_mnt
+ * (mount_modem_image() does umount2()+mount()), and start_cnss_stack()/
+ * start_modem_qmi_services() each run in their own forked child (see the
+ * cnss_qrtr_pid comment above) with independent, non-synchronized copies of
+ * the modem_mounted global -- calling it from both concurrently raced two
+ * mount()s against each other and changed pd-mapper's opendir() failure
+ * from ENOENT to EINVAL (confirmed live via the opendir LD_PRELOAD trace),
+ * i.e. made it worse, not better. Just wait for the directory to already be
+ * populated (whoever's mounting it gets there on its own -- confirmed
+ * elsewhere in boot, well before either of these call sites normally run)
+ * without touching mount state ourselves. Bounded at 10s so a genuinely
+ * stuck/missing modem partition doesn't hang pd-mapper's spawn forever. */
+static void wait_modem_fw_dir_ready(void)
+{
+    for (int i = 0; i < 20; i++) {
+        if (path_exists("/vendor/firmware_mnt/image/modem.mdt") ||
+            path_exists("/vendor/firmware_mnt/image/wlanmdsp.mbn"))
+            return;
+        usleep(500000);
+    }
+}
+
+/* Workaround, not a fix: pd-mapper's config-directory scan of
+ * /vendor/firmware_mnt/image (its first, normal candidate) gets a real,
+ * reproducible ENOENT from its own forked+exec_via_linker64 process for
+ * this one specific vfat-mounted subdirectory -- confirmed via an
+ * LD_PRELOAD opendir()/stat() trace inside pd-mapper itself, and confirmed
+ * NOT a narrow timing race: this init process (never itself exec'd, just
+ * running continuously since boot) polled the exact same path every 5s
+ * from t=5s to t=100s on a fresh boot and saw it fine every single time,
+ * while every exec_via_linker64-spawned daemon (qrtr-ns, cnss-daemon,
+ * pd-mapper alike) failed on it across a wide t=9-35s+ window. Root cause
+ * not yet found (MEMORY.md §4.5b8) -- this sidesteps it entirely by
+ * pre-staging the same .jsn files pd-mapper needs into
+ * /vendor/firmware, its own THIRD candidate directory, which its
+ * opendir() has been confirmed to open successfully every time. */
+static void stage_pdmapper_jsn_files(void)
+{
+    static const char *names[] = {
+        "modemr.jsn", "modemuw.jsn", "adspr.jsn", "adsps.jsn",
+        "adspua.jsn", "cdspr.jsn", NULL
+    };
+    char src[192], dst[192];
+    int copied = 0;
+
+    if (path_exists("/vendor/firmware/modemuw.jsn"))
+        return;
+
+    if (mount(NULL, "/vendor", NULL, MS_REMOUNT, NULL) != 0) {
+        LOGI("radio", "%s", "pdmapper-jsn: remount /vendor rw failed");
+        return;
+    }
+    for (int i = 0; names[i]; i++) {
+        snprintf(src, sizeof(src), "/vendor/firmware_mnt/image/%s", names[i]);
+        snprintf(dst, sizeof(dst), "/vendor/firmware/%s", names[i]);
+        if (path_exists(src) && copy_file_bin(src, dst) == 0)
+            copied++;
+    }
+    mount(NULL, "/vendor", NULL, MS_REMOUNT | MS_RDONLY, NULL);
+    {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "pdmapper-jsn: staged %d files", copied);
+        LOGI("radio", "%s", msg);
+    }
+}
+
+
 void start_modem_qmi_services(void)
 {
     const char *qrtr, *pdmap, *irsc;
@@ -1081,6 +1254,12 @@ void start_modem_qmi_services(void)
         plog_append("modem qmi: irsc_util done");
     }
     usleep(200000);
+
+    /* See the matching comment in start_cnss_stack() -- defensive, cheap,
+     * idempotent guard against spawning pd-mapper before its config
+     * directory is populated. */
+    wait_modem_fw_dir_ready();
+    stage_pdmapper_jsn_files();
 
     pdmap = stage_vendor_bin("pd-mapper");
     if (pdmap && !proc_running("pd-mapper")) {
@@ -1165,6 +1344,27 @@ void start_cnss_stack(void)
      * here before boot_modem(); post-PIL retry is below after boot_modem(). */
     plog_append("cnss: irsc_util skipped pre-boot_modem (early boot)");
     usleep(200000);
+
+    /* pd-mapper's config-directory scan (opendir() on
+     * /vendor/firmware_mnt/image and its 3 other candidates) fails with
+     * ENOENT for every one of them if spawned before that partition is
+     * mounted/populated -- confirmed live via an LD_PRELOAD shim logging
+     * pd-mapper's own opendir() calls directly (see minios/firmware/adb/
+     * cnss_shim.c). Once that happens pd-mapper still binds its QMI server
+     * and answers every servreg query with an empty domain list forever
+     * (proven via a wire-level capture matching real Lineage's own
+     * GET_DOMAIN_LIST protocol byte-for-byte, differing only in this
+     * result) -- there is no retry inside pd-mapper itself. Unlike
+     * start_modem_qmi_services() (which runs later in the overall boot
+     * sequence, after firmware_mnt is guaranteed populated),
+     * start_cnss_stack() has no such guarantee and was observed spawning
+     * pd-mapper as early as t=9.7s, well before the modem partition is
+     * ready. wait_modem_fw_dir_ready() (above) waits for it passively,
+     * without touching mount state itself -- see its own comment for why
+     * calling ensure_modem_firmware_mounted() directly here instead made
+     * things worse (EINVAL from a real concurrent-mount race). */
+    wait_modem_fw_dir_ready();
+    stage_pdmapper_jsn_files();
 
     pdmap = stage_vendor_bin("pd-mapper");
     if (!pdmap)

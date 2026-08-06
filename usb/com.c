@@ -10,6 +10,7 @@
 #include <sys/mount.h>
 #include <sys/reboot.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -257,7 +258,7 @@ int com_handle(int out, const char *line)
     if (!strcmp(line, "ping"))
         return write(out, "pong\r\n", 6), 1;
     if (!strcmp(line, "help")) {
-        const char *h = "commands: ping help status usb net drm dmesg dmesg-find kms touch touchmon adb adb-tcp adb-on usb-adb com-on ffslog fb radio wifi bt wifi-scan scan-result radio-log cnss-log crash-log qrtr-log pd-log icnss-state binder-state catlog qrtr-lookup diag-klog diag-mdlog qmdl-find vendor-has usb-diag proc-info logd-trace readfile radio-diag radio-pid qrtr-pid radio-ls wifi-fw metrics save-log sync clean-logs bt-attach modem-state boot-count pstore poweroff reboot recovery mount-debugfs\r\n";
+        const char *h = "commands: ping help status usb net drm dmesg dmesg-find kms touch touchmon adb adb-tcp adb-on usb-adb com-on ffslog fb radio wifi bt wifi-scan scan-result radio-log cnss-log crash-log qrtr-log pd-log icnss-state binder-state catlog qrtr-lookup diag-klog diag-mdlog qmdl-find vendor-has usb-diag proc-info logd-trace readfile writefile stat radio-diag radio-pid qrtr-pid radio-ls wifi-fw metrics save-log sync clean-logs bt-attach modem-state boot-count pstore poweroff reboot recovery mount-debugfs\r\n";
         write(out, h, strlen(h));
         return 1;
     }
@@ -793,6 +794,57 @@ int com_handle(int out, const char *line)
      * hardcoded to one specific path each; this covers everything else. */
     if (!strncmp(line, "readfile ", 9)) {
         com_read_file_out(out, line + 9, "no such file\r\n");
+        return 1;
+    }
+    /* writefile <path> <content>: write <content> (rest of line, may
+     * contain spaces) to <path>, no O_TRUNC/O_APPEND/O_CREAT -- matches
+     * `echo "content" > path` against an existing control file (sysfs/
+     * debugfs/tracefs attributes), not general file creation. Needed to
+     * configure ftrace's kprobe_events interface live (MEMORY.md §4.5b8),
+     * since CONFIG_FUNCTION_TRACER is off but CONFIG_KPROBE_EVENTS=y. */
+    if (!strncmp(line, "writefile ", 10)) {
+        char *sp = strchr(line + 10, ' ');
+        if (!sp) {
+            write(out, "usage: writefile <path> <content>\r\n", 36);
+            return 1;
+        }
+        *sp = '\0';
+        {
+            const char *path = line + 10;
+            const char *content = sp + 1;
+            size_t clen = strlen(content);
+            int fd = open(path, O_WRONLY);
+            char msg[224];
+            int n;
+            if (fd < 0) {
+                n = snprintf(msg, sizeof(msg), "writefile open %s failed errno=%d (%s)\r\n",
+                             path, errno, strerror(errno));
+            } else {
+                ssize_t w = write(fd, content, clen);
+                if (w < 0)
+                    n = snprintf(msg, sizeof(msg), "writefile write %s failed errno=%d (%s)\r\n",
+                                 path, errno, strerror(errno));
+                else
+                    n = snprintf(msg, sizeof(msg), "writefile %s wrote %zd/%zu bytes\r\n",
+                                 path, w, clen);
+                close(fd);
+            }
+            write(out, msg, (size_t)n);
+        }
+        return 1;
+    }
+    if (!strncmp(line, "stat ", 5)) {
+        struct stat st;
+        char b[192];
+        int n;
+        if (stat(line + 5, &st) != 0) {
+            n = snprintf(b, sizeof(b), "stat %s failed errno=%d\r\n", line + 5, errno);
+        } else {
+            n = snprintf(b, sizeof(b), "%s mode=%o uid=%d gid=%d rdev=%d:%d\r\n",
+                         line + 5, st.st_mode & 07777, (int)st.st_uid, (int)st.st_gid,
+                         major(st.st_rdev), minor(st.st_rdev));
+        }
+        write(out, b, (size_t)n);
         return 1;
     }
     /* catlog <name>: dump the tail of /tmp/<name>.log — start_vendor_daemon()

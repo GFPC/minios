@@ -121,6 +121,31 @@ void try_load_qrtr_snoop(void)
         }
     }
 
+    /* Diagnostic: kprobe on qrtr_local_enqueue() (net/qrtr/qrtr.c) — sees
+     * QRTR traffic delivered between two endpoints on THIS processor
+     * (kernel<->userspace, e.g. icnss's wlan_pd servreg lookup against
+     * pd-mapper), which qrtr_snoop.ko's RX/TX hooks above never see (those
+     * only capture packets crossing to/from the modem chip). Validated
+     * safe: a full real-Lineage cold boot with this hook armed captured
+     * the actual wlan/fw GET_DOMAIN_LIST exchange with pd-mapper cleanly,
+     * no crash, no reboot. */
+    {
+        const char *lpaths[] = {
+            "/lib/qrtr_snoop_local.ko",
+            "/lib/modules/qrtr_snoop_local.ko",
+            NULL,
+        };
+
+        for (int i = 0; lpaths[i]; i++) {
+            if (access(lpaths[i], R_OK) != 0)
+                continue;
+            if (load_ko_file(lpaths[i]) == 0) {
+                LOGI("radio", "%s %s", "qrtr_snoop_local ko ok", lpaths[i]);
+                break;
+            }
+        }
+    }
+
     /* Diagnostic (MEMORY.md §4.5ay): filtered do_filp_open kprobe, checks
      * whether MiniOS's own irsc_util reaches the same persist/rfs/modemst
      * EFS-sync paths real Android's irsc_util opens right before WLAN FW
@@ -737,12 +762,17 @@ void radio_early_modem_boot(void)
         LOGI("radio", "%s", "early modem: already ONLINE");
         return;
     }
-    if (!strcmp(st, "OFFLINE") || !strcmp(st, "UNKNOWN") || !strcmp(st, "?")) {
-        LOGI("radio", "%s", "early modem: boot");
-        boot_modem();
-        return;
-    }
-    LOGI("radio", "%s %s", "early modem: skip", st);
+    /* Was a whitelist of "OFFLINE"/"UNKNOWN"/"?" only -- live testing this
+     * session showed the real state read here is "OFFLINING" (not
+     * "OFFLINE"), which the whitelist silently skipped, meaning this
+     * function never actually called boot_modem() early at all; the modem
+     * only got its real subsystem_get() kick from the old, much-later call
+     * in cnss.c's start_cnss_stack(), at its usual ~40s point, regardless
+     * of this function running at t~25s. subsystem_get() is refcounted by
+     * the SSR framework, so calling it here for any non-ONLINE state is
+     * safe even if some other transition happens to already be pending. */
+    LOGI("radio", "%s", "early modem: boot");
+    boot_modem();
 }
 
 

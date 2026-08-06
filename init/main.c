@@ -352,6 +352,22 @@ int main(void)
      * /dev/kmsg: Permission denied"). */
     chmod("/dev/kmsg", 0620);
     chown("/dev/kmsg", 0, 1000);
+    /* Same devtmpfs-race bug, this time on /dev/null: confirmed live via
+     * `stat /dev/null` showing mode=644 despite the 0666 requested above —
+     * devtmpfs auto-created it first with a restrictive default, so the
+     * mknod() mode above was a no-op. 644's "other" bits are read-only, so
+     * any daemon dropped to a non-root/non-group-0 uid (qrtr-ns=2906,
+     * pd-mapper=1000) gets EACCES calling open("/dev/null", O_RDWR) —
+     * bionic's own __libc_init_AT_SECURE() does exactly that early in libc
+     * init (before any of the daemon's own code runs), and when the
+     * /sys/fs/selinux/null fallback also fails (no real SELinux here), it
+     * calls __early_abort() -- a deliberate SIGSEGV at address == source
+     * line number, which is the "translation fault at 0x000000a0" crash
+     * confirmed via dmesg with exception-trace enabled. cnss-daemon starts
+     * much later in boot and never hit this, which is why only the two
+     * early daemons (qrtr-ns, pd-mapper) ever crashed this way. */
+    chmod("/dev/null", 0666);
+    chmod("/dev/zero", 0666);
     mknod("/dev/urandom", S_IFCHR|0666, makedev(1,9));
 
     klog("=== MINIOS START ===");
@@ -413,6 +429,57 @@ int main(void)
         }
     }
 
+    /* Diagnostic (MEMORY.md §4.5b8): kprobe on fat_search_long() (the vfat
+     * driver's directory-entry search, called from vfat_lookup() on every
+     * fresh -- not dentry-cache-hit -- lookup of a name inside a vfat dir)
+     * via ftrace's kprobe_events interface (CONFIG_FUNCTION_TRACER is off
+     * on this kernel, but CONFIG_KPROBE_EVENTS=y is on). Must be armed
+     * here, before early_mount_modem_partition() (right below) does the
+     * very first lookup of /vendor/firmware_mnt/image this boot -- once
+     * any process resolves it successfully the dentry gets cached and
+     * later lookups (including this project's own repeated COM-driven
+     * `stat`/`readfile` checks all session) never call back into the fat
+     * driver at all, confirmed live: reading a known-good file through COM
+     * with this same kprobe armed produced zero trace entries. This is
+     * the earliest point in main() where debugfs (mounted just above) is
+     * available to write kprobe_events through. Best-effort: writes are
+     * simply ignored if the kernel rejects the syntax (kept -- ARM64
+     * needs %xN raw register refs and +0(%xN):string for pointer derefs
+     * needs explicit dereference syntax, not %xN:string directly, on
+     * this kernel version -- confirmed live before adding this). */
+    {
+        int kfd;
+        static const char *kcmds[] = {
+            "-:fatsl",
+            "p:fatsl fat_search_long name=+0(%x1):string len=%x2",
+            "-:fatsl_ret",
+            "r:fatsl_ret fat_search_long ret=%x0",
+            NULL
+        };
+        for (int i = 0; kcmds[i]; i++) {
+            kfd = open("/sys/kernel/debug/tracing/kprobe_events", O_WRONLY);
+            if (kfd >= 0) {
+                write(kfd, kcmds[i], strlen(kcmds[i]));
+                close(kfd);
+            }
+        }
+        kfd = open("/sys/kernel/debug/tracing/events/kprobes/fatsl/enable", O_WRONLY);
+        if (kfd >= 0) { write(kfd, "1", 1); close(kfd); }
+        kfd = open("/sys/kernel/debug/tracing/events/kprobes/fatsl_ret/enable", O_WRONLY);
+        if (kfd >= 0) { write(kfd, "1", 1); close(kfd); }
+        kfd = open("/sys/kernel/debug/tracing/tracing_on", O_WRONLY);
+        if (kfd >= 0) { write(kfd, "1", 1); close(kfd); }
+        pid_t fatsl_keepalive_pid = fork();
+        if (fatsl_keepalive_pid == 0) {
+            for (int i = 0; i < 2400; i++) {
+                int tfd = open("/sys/kernel/debug/tracing/tracing_on", O_WRONLY);
+                if (tfd >= 0) { write(tfd, "1", 1); close(tfd); }
+                usleep(50000);
+            }
+            _exit(0);
+        }
+    }
+
     disable_cpu_idle_retry();
 
     wdt_open();
@@ -443,6 +510,22 @@ int main(void)
         modem_qmi_services_start();
         start_rmtfs_daemons_early();
         plog_append("boot: early qmi+rmtfs done");
+        /* A thorough real-Lineage capture (cold boot, continuous dmesg +
+         * logcat) this session shows modem PIL trigger at kernel t=11.56s
+         * -- essentially right after icnss's own platform driver probes at
+         * t=0.6s, NOT deferred until a full userspace stack is up -- and
+         * wlfw connects only ~1.15s after "modem: Brought out of reset"
+         * (t=12.246 -> t=13.397), with zero dependency on wlan_pd/PDR/
+         * servreg visible anywhere in cnss-daemon's own narrated startup
+         * log. radio_early_modem_boot() (modem.c) was already written to
+         * do exactly this early trigger but was never actually called from
+         * anywhere -- dead code. The comment that used to justify deferring
+         * modem PIL this late ("early_modem_boot() burned the 40s modem
+         * bailout timer before QMI infrastructure was up") is satisfied
+         * right here: modem_qmi_services_start()/start_rmtfs_daemons_early()
+         * just ran above, so qrtr-ns/pd-mapper/rmt_storage are already
+         * listening before this trigger fires. */
+        radio_early_modem_boot();
     }
 
     radio_modem_recover_stuck();
@@ -520,6 +603,42 @@ int main(void)
         wdt_pet();
         disable_cpu_idle_retry();
         plog_poll();
+        /* Diagnostic (MEMORY.md §4.5b8 addendum): every forked descendant
+         * of start_job() (radio.c) -- both plain fork() children and
+         * exec_via_linker64()-spawned vendor daemons alike -- gets a real,
+         * reproducible ENOENT resolving /vendor/firmware_mnt/image, while
+         * main.c's own earlier-forked com_pid child (COM shell) always
+         * sees it fine. Logging this exact check from the ORIGINAL,
+         * never-(yet-)forked watchdog loop itself, on a slow interval,
+         * tests directly whether THIS process ever loses the same
+         * visibility, and if so, whether that lines up with when
+         * radio_poll() first actually fires a job below. */
+        {
+            static int wd_diag_n;
+            if ((wd_diag_n++ % 20) == 0) {
+                char wdmsg[64];
+                snprintf(wdmsg, sizeof(wdmsg), "wd-diag: fwmnt/image exists=%d",
+                         path_exists("/vendor/firmware_mnt/image/wlanmdsp.mbn"));
+                klog(wdmsg);
+            }
+        }
+        /* rmt_storage (RMTFS server) has been observed dying silently after
+         * a healthy startup (confirmed live: initializes fully -- "Done with
+         * init now waiting for messages!" -- then later vanishes with no
+         * crash/exit log at all). The modem polls RMTFS on its own schedule
+         * for whatever EFS/NV/firmware files it needs (including
+         * wlanmdsp.mbn, fetched only once the modem's internal wlan_pd
+         * bring-up actually starts, which can be tens of seconds after
+         * rmt_storage's first start) -- if the server is dead by the time
+         * that later request happens, it fails silently and WLAN firmware
+         * never loads, with no crash on either side to signal it. Re-check
+         * every ~10s for the life of the boot; start_rmtfs_daemons_early()
+         * is already a no-op via proc_running() whenever it's alive. */
+        {
+            static int rmtfs_keepalive_n;
+            if ((rmtfs_keepalive_n++ % 10) == 0)
+                start_rmtfs_daemons_early();
+        }
         radio_poll();
         if (!cmdline_has("minios.skip_usb=1"))
             usb_com_maintain();

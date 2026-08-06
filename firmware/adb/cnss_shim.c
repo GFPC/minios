@@ -168,6 +168,8 @@ void __libcpp_verbose_abort(const char *fmt, ...)
 #define __NR_write      64
 #define __NR_openat     56
 #define __NR_close      57
+#define __NR_nanosleep  101
+#define __NR_newfstatat 79
 #define __NR_fsync      82
 #define __NR_fchmod     52
 #define __NR_getpid     172
@@ -180,6 +182,16 @@ void __libcpp_verbose_abort(const char *fmt, ...)
 #define O_CREAT_V     0100
 #define O_APPEND_V    02000
 #define AF_QIPCRTR_V  42
+/* NOT the generic 00200000 -- arm64 overrides O_DIRECTORY to 040000
+ * (kernel/arch/arm64/include/uapi/asm/fcntl.h), diverging from most other
+ * architectures. Using the generic value here caused every opendir() call
+ * in this shim to fail with EINVAL, on EVERY path including "/" itself --
+ * a real, hour-costing self-inflicted diagnostic bug: since this shim is
+ * LD_PRELOADed into pd-mapper, its (broken) opendir() override replaced
+ * pd-mapper's own real bionic opendir() calls the moment it was added,
+ * making every finding gathered with it (mount-timing race, exec-order
+ * theory) an artifact of this bug rather than real pd-mapper behavior. */
+#define O_DIRECTORY_V 040000
 
 static long shim_syscall6(long nr, long a0, long a1, long a2,
                            long a3, long a4, long a5)
@@ -289,12 +301,10 @@ static void shim_log_qmi(const char *dir, int fd, const unsigned char *buf, long
     line[p++] = '\n';
 
     fdlog = (int)shim_syscall6(__NR_openat, AT_FDCWD_V,
-                                (long)"/mnt/sdcard/minios/qmi_trace.log",
-                                O_WRONLY_V | O_CREAT_V | O_APPEND_V, 0666, 0, 0);
+                                (long)"/dev/kmsg",
+                                O_WRONLY_V | O_APPEND_V, 0, 0, 0);
     if (fdlog >= 0) {
-        shim_syscall6(__NR_fchmod, fdlog, 0666, 0, 0, 0, 0);
         shim_syscall6(__NR_write, fdlog, (long)line, p, 0, 0, 0);
-        shim_syscall6(__NR_fsync, fdlog, 0, 0, 0, 0, 0);
         shim_syscall6(__NR_close, fdlog, 0, 0, 0, 0, 0);
     }
 }
@@ -336,13 +346,104 @@ static void shim_ctor_log(void)
     line[p++] = '\n';
 
     fdlog = (int)shim_syscall6(__NR_openat, AT_FDCWD_V,
-                                (long)"/mnt/sdcard/minios/qmi_trace.log",
-                                O_WRONLY_V | O_CREAT_V | O_APPEND_V, 0666, 0, 0);
+                                (long)"/dev/kmsg",
+                                O_WRONLY_V | O_APPEND_V, 0, 0, 0);
     if (fdlog >= 0) {
-        shim_syscall6(__NR_fchmod, fdlog, 0666, 0, 0, 0, 0);
         shim_syscall6(__NR_write, fdlog, (long)line, p, 0, 0, 0);
-        shim_syscall6(__NR_fsync, fdlog, 0, 0, 0, 0, 0);
         shim_syscall6(__NR_close, fdlog, 0, 0, 0, 0, 0);
+    }
+
+    /* Step-by-step path-resolution probe: is this process's failure total
+     * (can't even open "/") or specific to deeper paths? Bypasses the
+     * opendir() override entirely (raw syscall, same as it uses) to rule
+     * out any interposition quirk in that override itself. */
+    {
+        static const char *probes[] = {
+            "/", "/vendor", "/vendor/firmware_mnt",
+            "/vendor/firmware_mnt/image", 0
+        };
+        int i;
+        for (i = 0; probes[i]; i++) {
+            long pfd = shim_syscall6(__NR_openat, AT_FDCWD_V, (long)probes[i],
+                                      O_DIRECTORY_V, 0, 0, 0);
+            char pline[128];
+            int pp = 0;
+
+            shim_copy(pline, &pp, "SHIM probe ");
+            shim_copy(pline, &pp, probes[i]);
+            if (pfd < 0) {
+                shim_copy(pline, &pp, " errno=");
+                pp += shim_udec((unsigned)(-pfd), pline + pp);
+            } else {
+                shim_copy(pline, &pp, " OK fd=");
+                pp += shim_udec((unsigned)pfd, pline + pp);
+                shim_syscall6(__NR_close, pfd, 0, 0, 0, 0, 0);
+            }
+            pline[pp++] = '\n';
+
+            fdlog = (int)shim_syscall6(__NR_openat, AT_FDCWD_V, (long)"/dev/kmsg",
+                                        O_WRONLY_V | O_APPEND_V, 0, 0, 0);
+            if (fdlog >= 0) {
+                shim_syscall6(__NR_write, fdlog, (long)pline, pp, 0, 0, 0);
+                shim_syscall6(__NR_close, fdlog, 0, 0, 0, 0, 0);
+            }
+        }
+    }
+
+    /* Control test: stat() (newfstatat) on the specific failing directory,
+     * not open() at all -- isolates whether the VFS lookup itself succeeds
+     * (stat works, only the open-a-directory-handle step fails) vs the
+     * lookup failing outright regardless of which syscall performs it. */
+    {
+        char statbuf[256];
+        long sret = shim_syscall6(__NR_newfstatat, AT_FDCWD_V,
+                                   (long)"/vendor/firmware_mnt/image",
+                                   (long)statbuf, 0, 0, 0);
+        char sline[64];
+        int sp = 0;
+        int skfd;
+
+        shim_copy(sline, &sp, "SHIM stat image ");
+        if (sret < 0) {
+            shim_copy(sline, &sp, "errno=");
+            sp += shim_udec((unsigned)(-sret), sline + sp);
+        } else {
+            shim_copy(sline, &sp, "OK");
+        }
+        sline[sp++] = '\n';
+        skfd = (int)shim_syscall6(__NR_openat, AT_FDCWD_V, (long)"/dev/kmsg",
+                                   O_WRONLY_V | O_APPEND_V, 0, 0, 0);
+        if (skfd >= 0) {
+            shim_syscall6(__NR_write, skfd, (long)sline, sp, 0, 0, 0);
+            shim_syscall6(__NR_close, skfd, 0, 0, 0, 0, 0);
+        }
+    }
+
+    /* Control test: same path, flags=0 (plain O_RDONLY, no O_DIRECTORY) --
+     * isolates whether the flag itself is the problem or the path/process
+     * is denied outright regardless of flags. */
+    {
+        long pfd2 = shim_syscall6(__NR_openat, AT_FDCWD_V, (long)"/", 0, 0, 0, 0);
+        char pline2[64];
+        int pp2 = 0;
+
+        shim_copy(pline2, &pp2, "SHIM plainopen /");
+        if (pfd2 < 0) {
+            shim_copy(pline2, &pp2, " errno=");
+            pp2 += shim_udec((unsigned)(-pfd2), pline2 + pp2);
+        } else {
+            shim_copy(pline2, &pp2, " OK fd=");
+            pp2 += shim_udec((unsigned)pfd2, pline2 + pp2);
+            shim_syscall6(__NR_close, pfd2, 0, 0, 0, 0, 0);
+        }
+        pline2[pp2++] = '\n';
+
+        fdlog = (int)shim_syscall6(__NR_openat, AT_FDCWD_V, (long)"/dev/kmsg",
+                                    O_WRONLY_V | O_APPEND_V, 0, 0, 0);
+        if (fdlog >= 0) {
+            shim_syscall6(__NR_write, fdlog, (long)pline2, pp2, 0, 0, 0);
+            shim_syscall6(__NR_close, fdlog, 0, 0, 0, 0, 0);
+        }
     }
 }
 
@@ -395,4 +496,192 @@ long write(int fd, const void *buf, unsigned long len)
     if (shim_is_qrtr(fd))
         shim_log_qmi("TX", fd, (const unsigned char *)buf, (long)len, 0, 0);
     return shim_syscall6(__NR_write, fd, (long)buf, (long)len, 0, 0, 0);
+}
+
+/* ------------------------------------------------------------------ */
+/* opendir() trace — direct ground truth for pd-mapper's json_dir_list */
+/* config-directory scan, which pd_locator queries show returns zero  */
+/* domains for every service despite the right .jsn files existing on */
+/* disk with correct permissions. Static analysis (Ghidra) traced this */
+/* to json_dir_list reading back NULL at runtime despite a valid       */
+/* R_AARCH64_RELATIVE relocation for it existing in the ELF file       */
+/* itself (confirmed via readelf -r) -- this hook settles definitively */
+/* whether main()'s config loop ever calls opendir() at all, and with  */
+/* what path, bypassing every open_snoop.ko capture-cap/hook-coverage  */
+/* question that made that kprobe-based approach inconclusive here.    */
+/* opendir() is a public bionic libc symbol so LD_PRELOAD interposition */
+/* works on it the same way it already does for read/write/socket      */
+/* above; fdopendir() is deliberately NOT overridden so the real bionic */
+/* libc.so implementation still builds the actual DIR* we return.      */
+/* ------------------------------------------------------------------ */
+
+typedef struct __dirstream DIR;
+extern DIR *fdopendir(int fd);
+
+DIR *opendir(const char *path)
+{
+    long fd;
+    char line[300];
+    int p = 0, fdlog;
+    int retries = 0;
+
+    fd = shim_syscall6(__NR_openat, AT_FDCWD_V, (long)path,
+                        O_DIRECTORY_V, 0, 0, 0);
+
+    /* Retry on ENOENT specifically: confirmed live that pd-mapper's config
+     * directory opendir() can fail with ENOENT for /vendor/firmware_mnt/
+     * image even though the vfat mount itself is verified present and
+     * accessible at the exact same moment (mountinfo dump + a probe of the
+     * mount root both succeed) -- consistent with a stale VFS negative
+     * dentry cache entry from an earlier, premature lookup rather than a
+     * real absence. If that's right, a short wait plus retry should see
+     * it clear; if it's something more persistent this just costs a few
+     * hundred ms before falling through to the real (still failing)
+     * result, which is what would have happened anyway. */
+    while (fd == -2 && path && retries < 10) {
+        struct { long tv_sec; long tv_nsec; } ts = { 0, 300000000L };
+        shim_syscall6(__NR_nanosleep, (long)&ts, 0, 0, 0, 0, 0);
+        fd = shim_syscall6(__NR_openat, AT_FDCWD_V, (long)path,
+                            O_DIRECTORY_V, 0, 0, 0);
+        retries++;
+    }
+
+    /* On failure for the specific mount we care about, dump this
+     * process's OWN /proc/self/mountinfo right at the moment of failure --
+     * ground truth for whether this process's mount namespace actually
+     * shows /vendor/firmware_mnt mounted at all, rather than assuming
+     * shared-namespace semantics apply. */
+    if (fd < 0 && path) {
+        const char *n1 = "firmware_mnt";
+        int match = 0, ci, ni;
+        for (ci = 0; path[ci]; ci++) {
+            for (ni = 0; n1[ni] && path[ci + ni] == n1[ni]; ni++)
+                ;
+            if (!n1[ni]) { match = 1; break; }
+        }
+        if (match) {
+            int mfd = (int)shim_syscall6(__NR_openat, AT_FDCWD_V,
+                                          (long)"/proc/self/mountinfo", 0, 0, 0, 0);
+            if (mfd >= 0) {
+                char mbuf[2048];
+                long mn = shim_syscall6(__NR_read, mfd, (long)mbuf, sizeof(mbuf) - 1, 0, 0, 0);
+                shim_syscall6(__NR_close, mfd, 0, 0, 0, 0, 0);
+                if (mn > 0) {
+                    /* /dev/kmsg silently drops large multi-line single
+                     * write()s -- write one line at a time instead,
+                     * matching every other working log call in this shim,
+                     * and only lines containing "firmware_mnt" (or the
+                     * count of total lines scanned, as a control) to keep
+                     * this bounded and readable. */
+                    long lstart = 0, li;
+                    int lines_seen = 0, lines_matched = 0;
+
+                    mbuf[mn] = '\0';
+                    for (li = 0; li <= mn; li++) {
+                        if (li == mn || mbuf[li] == '\n') {
+                            long llen = li - lstart;
+                            lines_seen++;
+                            if (llen > 0 && llen < 250) {
+                                char tmp[256];
+                                long ti;
+                                int has_match = 0;
+                                for (ti = 0; ti < llen - 12; ti++) {
+                                    if (mbuf[lstart + ti] == 'f' &&
+                                        mbuf[lstart + ti + 1] == 'i' &&
+                                        mbuf[lstart + ti + 2] == 'r' &&
+                                        mbuf[lstart + ti + 3] == 'm') {
+                                        has_match = 1;
+                                        break;
+                                    }
+                                }
+                                if (has_match) {
+                                    int kfd;
+                                    int tp = 0;
+
+                                    shim_copy(tmp, &tp, "SHIM mountinfo: ");
+                                    for (ti = 0; ti < llen; ti++)
+                                        tmp[tp++] = mbuf[lstart + ti];
+                                    tmp[tp++] = '\n';
+                                    lines_matched++;
+
+                                    kfd = (int)shim_syscall6(__NR_openat, AT_FDCWD_V, (long)"/dev/kmsg",
+                                                              O_WRONLY_V | O_APPEND_V, 0, 0, 0);
+                                    if (kfd >= 0) {
+                                        shim_syscall6(__NR_write, kfd, (long)tmp, tp, 0, 0, 0);
+                                        shim_syscall6(__NR_close, kfd, 0, 0, 0, 0, 0);
+                                    }
+                                }
+                            }
+                            lstart = li + 1;
+                        }
+                    }
+                    {
+                        char sline[80];
+                        int sp = 0, kfd;
+
+                        shim_copy(sline, &sp, "SHIM mountinfo: lines_seen=");
+                        sp += shim_udec((unsigned)lines_seen, sline + sp);
+                        shim_copy(sline, &sp, " matched=");
+                        sp += shim_udec((unsigned)lines_matched, sline + sp);
+                        sline[sp++] = '\n';
+                        kfd = (int)shim_syscall6(__NR_openat, AT_FDCWD_V, (long)"/dev/kmsg",
+                                                  O_WRONLY_V | O_APPEND_V, 0, 0, 0);
+                        if (kfd >= 0) {
+                            shim_syscall6(__NR_write, kfd, (long)sline, sp, 0, 0, 0);
+                            shim_syscall6(__NR_close, kfd, 0, 0, 0, 0, 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    {
+        long pid = shim_syscall6(__NR_getpid, 0, 0, 0, 0, 0, 0);
+        int cfd = (int)shim_syscall6(__NR_openat, AT_FDCWD_V,
+                                      (long)"/proc/self/comm", 0, 0, 0, 0);
+        char comm[32];
+        long cn = 0;
+
+        if (cfd >= 0) {
+            cn = shim_syscall6(__NR_read, cfd, (long)comm, sizeof(comm) - 1, 0, 0, 0);
+            shim_syscall6(__NR_close, cfd, 0, 0, 0, 0, 0);
+        }
+        shim_copy(line, &p, "SHIM opendir pid=");
+        p += shim_udec((unsigned)pid, line + p);
+        shim_copy(line, &p, " comm=");
+        if (cn > 0) {
+            long ci;
+            if (comm[cn - 1] == '\n')
+                cn--;
+            for (ci = 0; ci < cn; ci++)
+                line[p++] = comm[ci];
+        } else {
+            line[p++] = '?';
+        }
+    }
+    shim_copy(line, &p, " path=");
+    if (path)
+        shim_copy(line, &p, path);
+    else
+        shim_copy(line, &p, "(null)");
+    if (fd < 0) {
+        shim_copy(line, &p, " errno=");
+        p += shim_udec((unsigned)(-fd), line + p);
+    } else {
+        shim_copy(line, &p, " fd=");
+        p += shim_udec((unsigned)fd, line + p);
+    }
+    line[p++] = '\n';
+
+    fdlog = (int)shim_syscall6(__NR_openat, AT_FDCWD_V, (long)"/dev/kmsg",
+                                O_WRONLY_V | O_APPEND_V, 0, 0, 0);
+    if (fdlog >= 0) {
+        shim_syscall6(__NR_write, fdlog, (long)line, p, 0, 0, 0);
+        shim_syscall6(__NR_close, fdlog, 0, 0, 0, 0, 0);
+    }
+
+    if (fd < 0)
+        return (DIR *)0;
+    return fdopendir((int)fd);
 }

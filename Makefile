@@ -22,7 +22,7 @@ INIT_SRCS := \
 
 UI_SRCS := ui/kms_paint.c ui/minui.c ui/touch.c ui/ui.c
 
-.PHONY: all init kms_paint wlan_scan ffs_adb propstub cnss_shim logd_stub drm_dump qrtr_lookup clean
+.PHONY: all init kms_paint wlan_scan ffs_adb propstub cnss_shim pm_client_stub logd_stub drm_dump qrtr_lookup clean
 
 all: init kms_paint
 
@@ -59,6 +59,12 @@ cnss_shim: $(OUT)/libcnss_shim.so
 
 $(OUT)/libcnss_shim.so: firmware/adb/cnss_shim.c | $(OUT)
 	$(CC) -shared -fPIC -Os -nostdlib -Wl,-soname,libcnss_shim.so \
+		-o $@ $<
+
+pm_client_stub: $(OUT)/libperipheral_client_stub.so
+
+$(OUT)/libperipheral_client_stub.so: radio/pm_client_stub.c | $(OUT)
+	$(CC) -shared -fPIC -Os -nostdlib -Wl,-soname,libperipheral_client.so \
 		-o $@ $<
 
 logd_stub: $(OUT)/logd_stub
