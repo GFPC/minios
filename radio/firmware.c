@@ -676,6 +676,22 @@ void set_firmware_class_path(void)
 }
 
 
+/* Was "modem." only. Real-Lineage capture this session (out/
+ * lineage_thorough_dmesg.txt) shows ueventd staging modem.mdt AND every
+ * modem.bNN PIL segment (b02-b29, matching the ELF program headers of
+ * this exact signed image) via request_firmware() -- confirmed all
+ * present and already correctly symlinked by this function's original
+ * "modem." case. But the SAME live boot that showed CDSP successfully
+ * booting also showed, earlier in the same boot:
+ * "subsys-pil-tz ... cdsp: Failed to locate cdsp.mdt(rc:-11)" -- this
+ * function never staged cdsp./adsp./slpi.-prefixed firmware at all, so
+ * CDSP's first PIL load attempt (triggered by boot_remote_procs()) always
+ * fails and only succeeds on a later retry, landing well after modem's
+ * own reset instead of before it as real hardware's own boot naturally
+ * orders them. Stage all three prefixes so CDSP's firmware is actually
+ * findable on the first attempt. */
+static const char *pil_fw_prefixes[] = { "modem.", "cdsp.", "adsp.", "slpi.", NULL };
+
 int link_modem_pil_firmware_count(void)
 {
     const char *srcdir = "/vendor/firmware_mnt/image";
@@ -691,9 +707,19 @@ int link_modem_pil_firmware_count(void)
     if (!d)
         return 0;
     while ((e = readdir(d)) != NULL) {
+        int i, matched = 0;
+
         if (e->d_name[0] == '.')
             continue;
-        if (strncmp(e->d_name, "modem.", 6) != 0)
+        for (i = 0; pil_fw_prefixes[i]; i++) {
+            size_t plen = strlen(pil_fw_prefixes[i]);
+
+            if (!strncmp(e->d_name, pil_fw_prefixes[i], plen)) {
+                matched = 1;
+                break;
+            }
+        }
+        if (!matched)
             continue;
         snprintf(src, sizeof(src), "%s/%s", srcdir, e->d_name);
         snprintf(dst, sizeof(dst), "/lib/firmware/%s", e->d_name);
@@ -919,11 +945,20 @@ static const char *find_wlan_fw_src(const char *name)
 
 void ensure_rmtfs_readonly_layout(void)
 {
-    static const char *bins[] = {
-        "wlanmdsp.mbn",
-        "bdwlan.bin", "bdwlan.b02", "bdwlan.b04", "bdwlan.b05",
-        "bdwlan.b06", "bdwlan.b07", "bdwlan.b08", "bdwlan.b09",
-        "bdwlan.b0a", "bdwlan.b0b",
+    /* Real devices ship far more bdwlan.* board-data variants than any
+     * fixed list can predict — this device alone has bdwlan.102/104/.../
+     * 203 (a whole separate numeric scheme) plus bdwlan.b04/b07/.../b38,
+     * none of which match the old hand-picked bdwlan.b02/b05/b06/b08 list
+     * (which don't even exist on this device). The modem's own TFTP-over-
+     * QRTR file requests (qrtr-snoop, port 0x45xx) come back
+     * "Err=2 String=No such file or directory" for exactly the variants a
+     * fixed list can't cover. Enumerate the real source directory instead
+     * of guessing filenames, same pattern as link_modem_pil_firmware_count()
+     * uses for modem/adsp/cdsp/slpi PIL segments. */
+    static const char *srcdirs[] = {
+        "/vendor/firmware_mnt/image",
+        "/vendor/firmware/wlan/qca_cld",
+        "/lib/firmware/wlan/qca_cld",
         NULL
     };
     static const char *link_fmt[] = {
@@ -933,28 +968,44 @@ void ensure_rmtfs_readonly_layout(void)
         NULL
     };
     char link[384];
-    int linked = 0;
+    int linked = 0, files = 0;
 
     md("/readonly/firmware/image");
     md("/readonly/vendor/firmware");
     md("/readonly/vendor/firmware_mnt/image");
 
-    for (int i = 0; bins[i]; i++) {
-        const char *src = find_wlan_fw_src(bins[i]);
-        if (!src)
+    for (int d = 0; srcdirs[d]; d++) {
+        DIR *dh = opendir(srcdirs[d]);
+        struct dirent *e;
+
+        if (!dh)
             continue;
-        for (int j = 0; link_fmt[j]; j++) {
-            snprintf(link, sizeof(link), link_fmt[j], bins[i]);
-            symlink_firmware(src, link);
-            if (path_exists(link))
-                linked++;
+        while ((e = readdir(dh)) != NULL) {
+            char src[384];
+
+            if (e->d_name[0] == '.')
+                continue;
+            if (strncmp(e->d_name, "bdwlan", 6) &&
+                strncmp(e->d_name, "wlanmdsp", 8))
+                continue;
+            snprintf(src, sizeof(src), "%s/%s", srcdirs[d], e->d_name);
+            files++;
+            for (int j = 0; link_fmt[j]; j++) {
+                snprintf(link, sizeof(link), link_fmt[j], e->d_name);
+                if (path_exists(link))
+                    continue;
+                symlink_firmware(src, link);
+                if (path_exists(link))
+                    linked++;
+            }
         }
+        closedir(dh);
     }
     {
         char line[96];
         const char *wm = find_wlan_fw_src("wlanmdsp.mbn");
-        snprintf(line, sizeof(line), "rmtfs-readonly: wlanmdsp=%s links=%d",
-                 wm ? wm : "missing", linked);
+        snprintf(line, sizeof(line), "rmtfs-readonly: wlanmdsp=%s files=%d links=%d",
+                 wm ? wm : "missing", files, linked);
         radio_trace(line);
     }
 }

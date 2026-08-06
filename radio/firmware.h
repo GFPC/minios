@@ -28,6 +28,7 @@ void symlink_firmware(const char *target, const char *linkpath);
 void symlink_if_missing(const char *target, const char *linkpath);
 void link_fw_bin(const char *srcdir, const char *name);
 void link_modem_pil_firmware(void);
+int link_modem_pil_firmware_count(void);
 void harvest_fw_bins(const char *srcdir, int depth);
 void link_board_data_variants(const char *srcdir);
 void link_fw_version_aliases(void);

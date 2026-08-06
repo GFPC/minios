@@ -525,6 +525,73 @@ int main(void)
          * right here: modem_qmi_services_start()/start_rmtfs_daemons_early()
          * just ran above, so qrtr-ns/pd-mapper/rmt_storage are already
          * listening before this trigger fires. */
+        /* EXPERIMENTAL: the same real-Lineage capture shows cdsp: Brought
+         * out of reset at t=11.79s, BEFORE modem's own reset at t=12.25s --
+         * CDSP boots first, every time, on real hardware. boot_remote_procs()
+         * (CDSP+SLPI trigger) exists in this codebase but has never been
+         * called -- an old comment in cnss.c says it "stays removed —
+         * booting CDSP/SLPI triggers SSR" without full vendor services, but
+         * that finding predates this session's fixes (pm-service stub,
+         * rmt_storage keepalive, early modem PIL trigger). Given the modem's
+         * own WLAN co-processor firmware has been confirmed (via QMI wire
+         * trace, this session) to complete MSA_READY but never transition
+         * to FW_MEM_READY -- and CDSP/modem/WLAN share silicon and power
+         * rails on this SoC -- try matching real hardware's boot order
+         * directly. boot_remote_procs() already no-ops safely on any sysfs
+         * node it can't write to. */
+        /* link_modem_pil_firmware() now stages cdsp./adsp./slpi.-prefixed
+         * firmware too (see firmware.c) -- must run BEFORE
+         * boot_remote_procs() triggers the CDSP/SLPI PIL load, or that
+         * first attempt fails with "Failed to locate cdsp.mdt" (confirmed
+         * live) and only succeeds on a later retry, well after modem's
+         * own reset instead of before it. radio_early_modem_boot() below
+         * would otherwise be the first thing to call this, too late for
+         * CDSP's own trigger just above it. */
+        {
+            /* Diagnostic build confirmed live: this reliably reads 0 files
+             * here on the first try -- early_mount_modem_partition() (much
+             * earlier in this same function) does its own first mount
+             * attempt, but the modem blockdev is not always ready by then
+             * (an established, historical pattern in this codebase --
+             * radio_early_modem_boot() below retries its own mount for
+             * exactly this reason). Without a real mount yet,
+             * /vendor/firmware_mnt/image isn't there for this function to
+             * scan at all. Retry mounting (matching radio_early_modem_boot
+             * ()'s own try_mount_part() call) for up to ~2s before staging,
+             * so boot_remote_procs() right after has an actual chance of
+             * finding cdsp.mdt on its first attempt. */
+            int pilfw_n, tries, scan_tries;
+
+            for (tries = 0; tries < 20 && !modem_mounted; tries++) {
+                if (try_mount_part("modem", "/vendor/firmware_mnt") == 0)
+                    modem_mounted = 1;
+                else
+                    usleep(100000);
+            }
+            /* Confirmed live: mounted=1 on the very first check (tries=0)
+             * but link_modem_pil_firmware_count() still read 0 files --
+             * the mount() itself succeeding doesn't mean an opendir() right
+             * after it will actually see the vfat directory's real content.
+             * This exact class of bug (stale/negative dcache entry from a
+             * lookup that raced the mount, resolving fine on a plain
+             * retry) was already root-caused earlier this session for
+             * pd-mapper's own opendir() on this same firmware_mnt path --
+             * apply the same proven fix here: just retry the scan itself a
+             * few times. */
+            pilfw_n = link_modem_pil_firmware_count();
+            for (scan_tries = 0; pilfw_n == 0 && scan_tries < 10; scan_tries++) {
+                usleep(200000);
+                pilfw_n = link_modem_pil_firmware_count();
+            }
+            {
+                char pilfw_msg[96];
+                snprintf(pilfw_msg, sizeof(pilfw_msg),
+                         "pil fw staged: %d files (mounted=%d tries=%d scan_tries=%d)",
+                         pilfw_n, modem_mounted, tries, scan_tries);
+                LOGI("radio", "%s", pilfw_msg);
+            }
+        }
+        boot_remote_procs();
         radio_early_modem_boot();
     }
 

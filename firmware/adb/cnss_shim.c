@@ -778,3 +778,55 @@ int open(const char *path, int flags, ...)
     }
     return openat(AT_FDCWD_V, path, flags, mode);
 }
+
+/* cnss-daemon's own binary (confirmed via readelf --dyn-syms on the real
+ * vendor blob) imports ONLY dlopen and fopen -- no open/openat/open64/
+ * openat64 at all. Bionic's fopen() calls its own internal open() through a
+ * private, non-interposable path, so the openat()/open() override above
+ * has been completely blind to every file cnss-daemon has ever touched
+ * this whole investigation -- confirmed live: zero "SHIM openat" hits ever,
+ * despite real Lineage's cnss-daemon reading /data/vendor/wifi/wlfw_cal_*
+ * .bin files (via fopen(), per its own logcat: "wlfw_read_file") right
+ * after connecting to wlfw. Hook fopen() itself via the standard
+ * dlsym(RTLD_NEXT, ...) interposition pattern instead of a raw syscall,
+ * since FILE* is an opaque bionic-internal structure this -nostdlib shim
+ * has no business constructing itself. */
+#define RTLD_NEXT_V ((void *)-1L)
+extern void *dlsym(void *handle, const char *symbol);
+
+typedef void *(*fopen_fn_t)(const char *path, const char *mode);
+static fopen_fn_t real_fopen;
+
+void *fopen(const char *path, const char *mode)
+{
+    void *result;
+    int interesting;
+
+    if (!real_fopen)
+        real_fopen = (fopen_fn_t)dlsym(RTLD_NEXT_V, "fopen");
+
+    interesting = shim_path_has(path, "wifi");
+    result = real_fopen ? real_fopen(path, mode) : (void *)0;
+
+    if (interesting) {
+        char line[300];
+        int p = 0;
+
+        shim_copy(line, &p, "SHIM fopen path=");
+        shim_copy(line, &p, path ? path : "(null)");
+        shim_copy(line, &p, " mode=");
+        shim_copy(line, &p, mode ? mode : "(null)");
+        shim_copy(line, &p, result ? " -> OK" : " -> NULL");
+        line[p++] = '\n';
+        {
+            int fdlog = (int)shim_syscall6(__NR_openat, AT_FDCWD_V, (long)"/dev/kmsg",
+                                            O_WRONLY_V | O_APPEND_V, 0, 0, 0);
+            if (fdlog >= 0) {
+                shim_syscall6(__NR_write, fdlog, (long)line, p, 0, 0, 0);
+                shim_syscall6(__NR_close, fdlog, 0, 0, 0, 0, 0);
+            }
+        }
+    }
+
+    return result;
+}

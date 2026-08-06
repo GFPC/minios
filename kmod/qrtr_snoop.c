@@ -16,8 +16,17 @@
 #include <linux/uaccess.h>
 #include <linux/atomic.h>
 
-#define QS_MAX_DUMP 64
-/* Was 2000 — real-ROM captures showed that's exhausted by ~7s of chatty
+#define QS_MAX_DUMP 150
+/* Raised from 64 to 150 — the 64-byte cap was truncating every RX/TX
+ * hexdump before the actual filename in TFTP-over-QRTR file requests
+ * (e.g. "/readonly/vendor/firmware_mnt/..." always cut off right after the
+ * directory prefix, before the real filename that would explain an ENOENT
+ * reply). Observed packet sizes for this exchange are up to RX len=136 —
+ * 150 covers every packet seen so far with a little headroom, while keeping
+ * the on-stack hex buffer (150*3+1 = 451 bytes) well within a kprobe
+ * handler's normal stack budget.
+ *
+ * Was 2000 — real-ROM captures showed that's exhausted by ~7s of chatty
  * QRTR traffic (t=8.5s module load to t=15.9s cap, MEMORY.md §4.5av),
  * long before MiniOS's own modem-reset (~t=78s) or panic (~t=118s) points
  * it actually needs to span. Raised 10x: at the same ~270 pkt/s burst rate
