@@ -112,6 +112,17 @@ void try_load_qrtr_snoop(void)
         NULL,
     };
 
+    /* Diagnostic (this session): register_kprobe() for this module's two
+     * symbols (qrtr_endpoint_post, qcom_smd_qrtr_send) fails with -ENOSYS
+     * every time this .ko is the very first kprobe-based module inserted
+     * after boot (~1.68s), while identical register_kprobe() calls in
+     * qrtr_snoop_local.ko/open_snoop.ko succeed cleanly ~16-20ms later —
+     * confirmed via kprobes.c-level tracing that NONE of register_kprobe()'s
+     * own exit paths are hit for these two calls, a genuine unexplained
+     * paradox. Testing whether this is purely an early-boot timing race by
+     * delaying this specific insmod; remove if this doesn't fix it. */
+    usleep(150000);
+
     for (int i = 0; paths[i]; i++) {
         if (access(paths[i], R_OK) != 0)
             continue;
@@ -350,6 +361,35 @@ void start_diag_mdlog(void)
     pid_t p = start_vendor_daemon(bin, argv);
     LOGI("radio", "diag_mdlog: start pid=%d", (int)p);
     plog_append(p > 0 ? "diag_mdlog: started" : "diag_mdlog: start failed");
+}
+
+/* diag_mdlog is the real vendor tool but this device's actual /vendor
+ * doesn't ship it (§4.5b4 — confirmed via vendor-has, only present in the
+ * stock_miui reference dump, an eng-build artifact). diag_capture
+ * (scratch/diag_capture.c, MiniOS's own, staged to /sbin regardless of
+ * vendor content) opens /dev/diag directly in MEMORY_DEVICE_MODE and dumps
+ * every raw DIAG packet to a file — no QXDM/QPST needed, just a binary
+ * substring search afterward for embedded F3/ERR/FATAL ASCII text. Static
+ * ELF (like logd_stub) -- direct fork+execv, no linker64. */
+void start_diag_capture(void)
+{
+    static const char *path = "/sbin/diag_capture";
+
+    if (proc_running("diag_capture") || !path_exists(path))
+        return;
+    char *argv[] = { (char *)"diag_capture", (char *)"/tmp/diag_raw.bin", NULL };
+    pid_t p = fork();
+    if (p == 0) {
+        setsid();
+        int fd = open("/dev/null", O_RDONLY);
+        if (fd >= 0) { dup2(fd, 0); close(fd); }
+        fd = open("/tmp/diag_capture.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); close(fd); }
+        execv(path, argv);
+        _exit(127);
+    }
+    LOGI("radio", "diag_capture: start pid=%d", (int)p);
+    plog_append(p > 0 ? "diag_capture: started" : "diag_capture: start failed");
 }
 
 /* Both daemons above used to only start deep inside boot_modem(), which

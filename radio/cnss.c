@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #include "cnss.h"
 #include "firmware.h"
+#include "modem.h"
 #include "radio.h"
 #include "radio_state.h"
 #include "radio_utils.h"
@@ -157,6 +158,26 @@ static void cnss_raise_cap(unsigned cap, const char *label)
     data[0].effective = data[0].permitted = data[0].inheritable = (1U << cap);
     if (syscall(SYS_capset, &hdr, data) != 0) {
         snprintf(msg, sizeof(msg), "%s: capset failed errno=%d (%s)", label, errno, strerror(errno));
+        cnss_log_line(msg);
+        return;
+    }
+
+    /* capset() above only reaches effective/permitted/inheritable of THIS
+     * (pre-exec) process image. This function's whole purpose is to survive
+     * the execve()/exec_via_linker64() that follows shortly after (into the
+     * real, unprivileged, no-file-capabilities cnss-daemon binary) -- and
+     * per the kernel's own exec capability rules, inheritable alone does
+     * NOT propagate into the new image's effective/permitted set unless the
+     * target binary has matching file capabilities (it doesn't) or the
+     * AMBIENT set carries it across. Confirmed via a real capset failure
+     * this session: cnss-daemon's own "Failed to init genl between daemon
+     * and platform" (net/wireless/cnss_genl's GENL_ADMIN_PERM ops need
+     * CAP_NET_ADMIN in the *running* daemon's effective set, not just this
+     * pre-exec process) -- was silently losing the capability at exec time
+     * despite this function successfully setting it beforehand. Without
+     * this, keep_cap=CAP_NET_ADMIN was a no-op past the exec boundary. */
+    if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, cap, 0, 0) != 0) {
+        snprintf(msg, sizeof(msg), "%s: PR_CAP_AMBIENT_RAISE failed errno=%d (%s)", label, errno, strerror(errno));
         cnss_log_line(msg);
     }
 }
@@ -1290,6 +1311,14 @@ void start_cnss_stack(void)
     ensure_android_roots();
     ensure_wifi_config();
     ensure_cnss_devnodes();
+    /* /dev/diag only reliably exists from this point on (ensure_cnss_
+     * devnodes() above just mknod'd it) -- starting diag_capture any
+     * earlier than this (tried: right after try_load_qrtr_snoop() in
+     * main.c) meant it gave up after a 60s retry budget with /dev/diag
+     * still not present. This call site is right before cnss-daemon/wlfw
+     * negotiation even begins, so it still covers the whole MSA_READY ->
+     * FW_MEM_READY window. */
+    start_diag_capture();
     /* stage_cnss_libs() must run BEFORE start_binder_services(): it copies
      * libhwbinder.so/libhidltransport.so/libhidlbase.so/libvintf.so etc.
      * into /lib64, which hwservicemanager/vndservicemanager need to even

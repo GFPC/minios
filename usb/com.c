@@ -204,6 +204,35 @@ void com_qmdl_find(int out, const char *needle, int max_matches)
         write(out, "no match\r\n", 10);
 }
 
+void com_diag_capture_find(int out, const char *needle, int max_matches)
+{
+    int fd = open("/tmp/diag_raw.bin", O_RDONLY);
+    if (fd < 0) {
+        write(out, "no /tmp/diag_raw.bin (diag-capture not run yet?)\r\n", 52);
+        return;
+    }
+    size_t nlen = needle ? strlen(needle) : 0;
+    if (nlen == 0) {
+        write(out, "no pattern\r\n", 12);
+        close(fd);
+        return;
+    }
+    static char buf[4 * 1024 * 1024];
+    ssize_t total = 0;
+    while (total < (ssize_t)sizeof(buf)) {
+        ssize_t n = read(fd, buf + total, sizeof(buf) - (size_t)total);
+        if (n <= 0)
+            break;
+        total += n;
+    }
+    close(fd);
+    int matches = 0;
+    if (total > 0)
+        qmdl_scan_buf(out, buf, (size_t)total, needle, nlen, &matches, max_matches);
+    if (matches == 0)
+        write(out, "no match\r\n", 10);
+}
+
 void com_read_file_out(int out, const char *path, const char *missing)
 {
     int fd = open(path, O_RDONLY);
@@ -258,7 +287,7 @@ int com_handle(int out, const char *line)
     if (!strcmp(line, "ping"))
         return write(out, "pong\r\n", 6), 1;
     if (!strcmp(line, "help")) {
-        const char *h = "commands: ping help status usb net drm dmesg dmesg-find kms touch touchmon adb adb-tcp adb-on usb-adb com-on ffslog fb radio wifi bt wifi-scan scan-result radio-log cnss-log crash-log qrtr-log pd-log icnss-state binder-state catlog qrtr-lookup diag-klog diag-mdlog qmdl-find vendor-has usb-diag proc-info logd-trace readfile writefile stat radio-diag radio-pid qrtr-pid radio-ls wifi-fw metrics save-log sync clean-logs bt-attach modem-state boot-count pstore poweroff reboot recovery mount-debugfs\r\n";
+        const char *h = "commands: ping help status usb net drm dmesg dmesg-find kms touch touchmon adb adb-tcp adb-on usb-adb com-on ffslog fb radio wifi bt wifi-scan scan-result radio-log cnss-log crash-log qrtr-log pd-log icnss-state binder-state catlog qrtr-lookup diag-klog diag-mdlog qmdl-find diag-capture diag-capture-find vendor-has usb-diag proc-info logd-trace readfile writefile stat radio-diag radio-pid qrtr-pid radio-ls wifi-fw metrics save-log sync clean-logs bt-attach modem-state boot-count pstore poweroff reboot recovery mount-debugfs\r\n";
         write(out, h, strlen(h));
         return 1;
     }
@@ -922,6 +951,15 @@ int com_handle(int out, const char *line)
     }
     if (!strncmp(line, "qmdl-find ", 10)) {
         com_qmdl_find(out, line + 10, 40);
+        return 1;
+    }
+    if (!strcmp(line, "diag-capture")) {
+        start_diag_capture();
+        write(out, "diag_capture started -> /tmp/diag_raw.bin (raw DIAG, MEMORY_DEVICE_MODE)\r\n", 76);
+        return 1;
+    }
+    if (!strncmp(line, "diag-capture-find ", 18)) {
+        com_diag_capture_find(out, line + 18, 40);
         return 1;
     }
     if (!strncmp(line, "vendor-has ", 11)) {

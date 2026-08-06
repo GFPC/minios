@@ -18,6 +18,7 @@ void radio_stage_early_bins(void);
 void radio_probe_now(void);
 void start_diag_klog(void);
 void start_diag_mdlog(void);
+void start_diag_capture(void);
 const char *vendor_bin(const char *name);
 int path_exists(const char *p);
 
