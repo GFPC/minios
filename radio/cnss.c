@@ -1322,13 +1322,30 @@ void start_cnss_stack(void)
     ensure_wifi_config();
     ensure_cnss_devnodes();
     /* /dev/diag only reliably exists from this point on (ensure_cnss_
-     * devnodes() above just mknod'd it) -- starting diag_capture any
+     * devnodes() above just mknod'd it) -- starting a diag reader any
      * earlier than this (tried: right after try_load_qrtr_snoop() in
      * main.c) meant it gave up after a 60s retry budget with /dev/diag
      * still not present. This call site is right before cnss-daemon/wlfw
      * negotiation even begins, so it still covers the whole MSA_READY ->
-     * FW_MEM_READY window. */
-    start_diag_capture();
+     * FW_MEM_READY window.
+     *
+     * Auto-starting the real vendor diag_mdlog here instead of our own
+     * diag_capture (scratch/diag_capture.c) -- diag_mdlog is the mature,
+     * correct tool (mask setup, HDLC framing, per-peripheral config all
+     * handled properly instead of hand-rolled and getting subtly wrong);
+     * it was previously confirmed absent from this device's actual live
+     * /vendor (a stripped retail image, §4.5b4) but is now bundled
+     * straight from the stock_miui eng-build reference dump into
+     * minios/assets/vendor_radio/bin/ (its one dependency, libdiag.so,
+     * was already bundled there from earlier work) -- build-initramfs.sh
+     * already copies this whole assets tree into /vendor/bin as a
+     * fallback whenever the live vendor mount doesn't have a given name,
+     * so stage_vendor_bin("diag_mdlog") now finds it with no further
+     * code changes needed. Don't run both diag_capture and diag_mdlog at
+     * once -- they'd fight over the same /dev/diag MEMORY_DEVICE_MODE
+     * switch; diag_capture remains available standalone via its own
+     * "diag-capture" COM command if ever needed again. */
+    start_diag_mdlog();
     /* stage_cnss_libs() must run BEFORE start_binder_services(): it copies
      * libhwbinder.so/libhidltransport.so/libhidlbase.so/libvintf.so etc.
      * into /lib64, which hwservicemanager/vndservicemanager need to even
