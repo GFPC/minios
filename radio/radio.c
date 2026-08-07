@@ -431,8 +431,21 @@ void radio_probe_now(void)
 
 void radio_scan_request_async(void)
 {
-    if (pid_alive(radio_pid))
+    if (pid_alive(radio_pid)) {
+        /* Previously a silent no-op: com.c's "wifi-scan" handler always
+         * prints "scan started" regardless of this return, so a request
+         * made while the main wifi/bt bringup job (radio_pid) is still
+         * running vanished with zero trace -- /tmp/wifi-scan.txt was
+         * never even created, and "scan-result" fell through to its
+         * generic "no scan yet" message, indistinguishable from having
+         * never run wifi-scan at all. Leave an explicit record instead. */
+        int fd = open("/tmp/wifi-scan.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            dprintf(fd, "radio bringup still running -- try wifi-scan again shortly\n");
+            close(fd);
+        }
         return;
+    }
     start_job(&scan_pid, scan_work);
 }
 
