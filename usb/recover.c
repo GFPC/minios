@@ -33,6 +33,41 @@ static int udc_sysfs_bound(void)
     return buf[0] != '\0';
 }
 
+/* Real, meaningful liveness signal: /sys/class/udc/<name>/state reflects
+ * gadget->state (the USB core's own enumeration state machine -- "not
+ * attached", "attached", "powered", "default", "address", "configured",
+ * "suspended"), updated by real SetAddress/SetConfiguration/disconnect
+ * events. This is what the two checks below were trying and failing to
+ * approximate: udc_controller_present() only checks that the dwc3 driver
+ * has *probed* (/sys/class/udc/<name> itself), which is created once at
+ * boot and never goes away for the rest of uptime regardless of any
+ * later cable/link state -- and udc_sysfs_bound() only checks that
+ * ConfigFS still has a UDC name *written*, which also doesn't get
+ * cleared just because the link died. Confirmed live: a real, reproduced
+ * full-USB-dropout event (SD-card boot.log, MEMORY.md §4.5c9) never
+ * self-recovered even after 4+ minutes -- well past this file's own
+ * IDLE_MISS_LIMIT threshold -- which is only explainable if udc_miss_streak
+ * never actually incremented at all, i.e. the old OR-gated check below
+ * was passing throughout. */
+static int udc_link_configured(void)
+{
+    char path[128], buf[32];
+    int fd, n;
+
+    if (!usb_udc_name[0])
+        return 0;
+    snprintf(path, sizeof(path), "/sys/class/udc/%s/state", usb_udc_name);
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    n = (int)read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return 0;
+    buf[n] = '\0';
+    return strncmp(buf, "configured", 10) == 0;
+}
+
 static int udc_controller_present(void)
 {
     char path[128];
@@ -97,7 +132,14 @@ void usb_com_maintain(void)
     if (!usb_udc_name[0])
         return;
 
-    if (udc_sysfs_bound() || udc_controller_present()) {
+    /* Real fix (MEMORY.md §4.5c9): this used to be
+     * "udc_sysfs_bound() || udc_controller_present()" -- both sides of
+     * that OR stay true essentially forever after boot regardless of
+     * actual link state (see udc_link_configured()'s comment above), so
+     * udc_miss_streak could never increment and neither recovery path
+     * below could ever fire. udc_link_configured() reads the real
+     * gadget->state enumeration state instead. */
+    if (udc_link_configured()) {
         udc_miss_streak = 0;
         return;
     }
