@@ -524,6 +524,70 @@ int main(void)
     plog_init();
     mount_pstore();
     plog_save_pstore();
+
+    /* USB moved here, ahead of the modem/radio bring-up block below --
+     * previously it ran after that entire sequence (QMI services, RMTFS,
+     * PIL firmware staging, boot_remote_procs()/CDSP+SLPI, the full modem
+     * PIL boot incl. partition mounts, radio_modem_recover_stuck(), and an
+     * explicit 5s "settle" sleep), which real-boot logs show reliably
+     * takes 140+ seconds end to end -- confirmed live via SD-card boot.log:
+     * led_prepare()'s "LED: found vibrator" line (a couple of statements
+     * after where usb_setup() used to sit) landed at kernel-relative
+     * t=145.58s on a fresh boot, essentially the entire modem sequence's
+     * length. This was never actually "USB first" despite the comment
+     * that used to sit right above the old call site -- USB, vibration,
+     * and LED were all just as stuck behind the modem block as anything
+     * else would have been. The modem/radio bring-up itself is legitimate,
+     * carefully-sequenced work (documented in detail below) and is left
+     * completely untouched; only the position of this independent,
+     * unrelated block changes. */
+    vib_pulse(300);
+    klog("vib pulse");
+
+    mount("configfs", "/config", "configfs", 0, NULL);
+    selinux_prepare();
+
+    led_prepare();
+    vib_pulse(100);
+
+    if (!cmdline_has("minios.skip_usb=1"))
+        usb_kick_apsd_rerun();
+
+    {
+        int usb_ok = 0;
+        if (!cmdline_has("minios.skip_usb=1")) {
+            usb_ok = (usb_setup() == 0);
+            wdt_pet();
+            klog(usb_ok ? "USB up" : "USB fail");
+            if (usb_ok)
+                led_blink(2);
+        } else {
+            klog("boot: skip USB (minios.skip_usb=1)");
+        }
+    }
+
+    /* Display disabled during boot-loop debug — kms_paint can panic DRM ~30s */
+    klog("display: skip async (boot stable mode)");
+
+    if (usb_com_active && !cmdline_has("minios.skip_usb=1")) {
+        pid_t com_pid = fork();
+        if (com_pid == 0) {
+            int tty_fd = usb_open_com_tty();
+            if (tty_fd >= 0) {
+                klog("COM shell start");
+                setsid();
+                dup2(tty_fd, 0);
+                dup2(tty_fd, 1);
+                dup2(tty_fd, 2);
+                if (tty_fd > 2)
+                    close(tty_fd);
+                com_shell(0);
+            }
+            klog("COM child exit");
+            _exit(1);
+        }
+    }
+
     /* Mount modem firmware partition early (paths only — no PIL trigger here).
      * boot_modem() runs later from the radio job once qrtr-ns/pd-mapper/rmt_storage
      * are already listening; early_modem_boot() burned the 40s modem bailout
@@ -654,54 +718,7 @@ int main(void)
         plog_append("boot: skip auto radio — use COM `radio` to trigger");
     }
 
-    /* immediate haptic ping — often works before LED drivers */
-    vib_pulse(300);
-    klog("vib pulse");
-
-    mount("configfs", "/config", "configfs", 0, NULL);
-    selinux_prepare();
-
-    /* USB first — display DRM must not block or panic before gadget is up */
-    led_prepare();
-    vib_pulse(100);
-
-    if (!cmdline_has("minios.skip_usb=1"))
-        usb_kick_apsd_rerun();
-
-    int usb_ok = 0;
-    if (!cmdline_has("minios.skip_usb=1")) {
-        usb_ok = (usb_setup() == 0);
-        wdt_pet();
-        klog(usb_ok ? "USB up" : "USB fail");
-        if (usb_ok)
-            led_blink(2);
-    } else {
-        klog("boot: skip USB (minios.skip_usb=1)");
-    }
-
-    /* Display disabled during boot-loop debug — kms_paint can panic DRM ~30s */
-    klog("display: skip async (boot stable mode)");
-
     /* Radio only on user request — wlan power-on can glitch USB/COM. */
-
-    if (usb_com_active && !cmdline_has("minios.skip_usb=1")) {
-        pid_t com_pid = fork();
-        if (com_pid == 0) {
-            int tty_fd = usb_open_com_tty();
-            if (tty_fd >= 0) {
-                klog("COM shell start");
-                setsid();
-                dup2(tty_fd, 0);
-                dup2(tty_fd, 1);
-                dup2(tty_fd, 2);
-                if (tty_fd > 2)
-                    close(tty_fd);
-                com_shell(0);
-            }
-            klog("COM child exit");
-            _exit(1);
-        }
-    }
 
     klog("main: watchdog loop");
     for (;;) {
