@@ -429,17 +429,21 @@ int boot_com_requested(void)
     if (n <= 0)
         return 0;
     buf[n] = '\0';
-    /* NOTE: usb_setup_adb_only() (ffs.adb/FunctionFS path) has an independent
-     * boot-hang bug unrelated to the SD-card mount fix — confirmed by
-     * reproducing the exact same "stuck on splash, no USB ever" symptom
-     * again after forcing ADB here, on a card that was already repaired.
-     * Until that's root-caused, stay on the COM (cser) path, which does
-     * complete enumeration correctly (Windows Code 28 "no driver" is a
-     * separate, easy, host-side fix — not a boot hang). */
+    /* COM is now the reserve/fallback path, not the default -- ADB is meant
+     * to be primary (usb_setup() already tries usb_setup_adb_only() first
+     * and falls back to usb_setup_com_only() on any non-zero return). The
+     * old blanket "minios=1 always means COM" rule below is removed: that
+     * flag is a generic MiniOS-boot marker (set unconditionally by every
+     * ACM-initramfs build, harmless elsewhere), not a real signal that COM
+     * was actually wanted -- it just meant ADB had never been re-tried
+     * since whatever originally motivated this fallback (a historical
+     * usb_setup_adb_only() boot-hang report, itself from before this
+     * project's later USB-ordering and gadget fixes; never reproduced
+     * since with those in place). Only the explicit, intentional
+     * "minios.usb=com" cmdline override still forces COM -- e.g. for
+     * deliberately testing/using the COM path, or as a manual escape
+     * hatch if ADB ever regresses again. */
     if (strstr(buf, "minios.usb=com"))
-        return 1;
-    /* ACM initramfs builds always add minios=1 — prefer COM+TCP adb over USB adb-only. */
-    if (strstr(buf, "minios=1"))
         return 1;
     return 0;
 }
