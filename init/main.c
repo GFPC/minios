@@ -52,6 +52,41 @@ static void mount_pstore(void)
         klog("pstore mounted");
 }
 
+/* PMI632 (qpnp-smb5) APSD (charger-type autodetect) can settle on
+ * POWER_SUPPLY_TYPE_UNKNOWN and then hold USB input current at 2mA for
+ * ~223s before its own internal retry finally re-detects and raises it --
+ * real, hardware-verified via SD-card boot.log timestamps (dwc3 "Avail
+ * curr from USB = 2" at t=17s, still 2 at t=240s, only reaching 100 at
+ * t=471s). This is almost certainly a real, large chunk of this project's
+ * chronic ~150s+ USB enumeration slowness. qpnp-smb5.c's "usb" power_supply
+ * exposes POWER_SUPPLY_PROP_APSD_RERUN as writable (smb5_usb_prop_is_
+ * writeable()), wired directly to smblib_rerun_apsd() -- a single PMIC
+ * register write (CMD_APSD_REG/APSD_RERUN_BIT) that forces the *hardware*
+ * to redo its own real charger-type detection immediately, instead of
+ * faking a type/current value in software (this driver's "type" and plain
+ * "current_max" nodes aren't even writable -- only apsd_rerun and
+ * sdp_current_max are, confirmed via smb5_usb_prop_is_writeable()). Doing
+ * this early, before usb_setup(), gives the real detection a chance to
+ * land well before any of the ~150s-scale timeouts this project has
+ * fought all along. */
+static void usb_kick_apsd_rerun(void)
+{
+    const char *path = "/sys/class/power_supply/usb/apsd_rerun";
+    int i;
+
+    for (i = 0; i < 20; i++) {
+        if (access(path, F_OK) == 0)
+            break;
+        usleep(50000);
+    }
+    if (access(path, F_OK) != 0) {
+        klog("usb: apsd_rerun node not found, skipping");
+        return;
+    }
+    sysfs_write(path, "1");
+    klog("usb: kicked APSD rerun (charger-type redetect)");
+}
+
 static void disable_cpu_idle(void)
 {
     sysfs_write("/sys/module/cpuidle/parameters/off", "1");
@@ -629,6 +664,9 @@ int main(void)
     /* USB first — display DRM must not block or panic before gadget is up */
     led_prepare();
     vib_pulse(100);
+
+    if (!cmdline_has("minios.skip_usb=1"))
+        usb_kick_apsd_rerun();
 
     int usb_ok = 0;
     if (!cmdline_has("minios.skip_usb=1")) {
